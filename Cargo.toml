@@ -22,6 +22,7 @@ tokio-stream = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
 wry = "0.57"
 urlencoding = "2"
+whisper-rs = { version = "0.16", features = ["metal"] }
 
 [profile.release]
 lto = "thin"

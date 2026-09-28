@@ -12,8 +12,17 @@ use tokio::io::AsyncWriteExt;
 
 use crate::translate::Progress;
 
-const MODEL_DIR: &str = "nllb-200-600m-int8";
-const REPO: &str = "https://huggingface.co/JustFrederik/nllb-200-distilled-600M-ct2-int8/resolve/main";
+/// Modèles proposés : (identifiant, dossier local, dépôt Hugging Face).
+pub const MODELS: [(&str, &str, &str); 2] = [
+    ("600m", "nllb-200-600m-int8", "JustFrederik/nllb-200-distilled-600M-ct2-int8"),
+    ("1.3b", "nllb-200-1.3b-int8", "JustFrederik/nllb-200-distilled-1.3B-ct2-int8"),
+];
+pub const DEFAULT_MODEL: &str = "1.3b";
+
+fn entry(name: &str) -> (&'static str, &'static str, &'static str) {
+    MODELS.iter().copied().find(|(n, _, _)| *n == name).unwrap_or(MODELS[1])
+}
+
 const FILES: [&str; 4] = ["config.json", "model.bin", "sentencepiece.bpe.model", "shared_vocabulary.txt"];
 
 /// Codes de langue NLLB (FLORES-200).
@@ -29,25 +38,26 @@ fn nllb_code(lang: &str) -> Option<&'static str> {
     })
 }
 
-pub fn model_dir(models_dir: &Path) -> PathBuf {
-    models_dir.join(MODEL_DIR)
+pub fn model_dir(models_dir: &Path, name: &str) -> PathBuf {
+    models_dir.join(entry(name).1)
 }
 
-pub fn is_ready(models_dir: &Path) -> bool {
-    FILES.iter().all(|f| model_dir(models_dir).join(f).is_file())
+pub fn is_ready(models_dir: &Path, name: &str) -> bool {
+    FILES.iter().all(|f| model_dir(models_dir, name).join(f).is_file())
 }
 
 /// Télécharge le modèle une seule fois dans le cache partagé (hors de l'app :
 /// réinstaller l'app ne le retélécharge pas).
-pub async fn ensure_model(models_dir: &Path, progress: &Progress) -> Result<PathBuf> {
-    let dir = model_dir(models_dir);
+pub async fn ensure_model(models_dir: &Path, name: &str, progress: &Progress) -> Result<PathBuf> {
+    let dir = model_dir(models_dir, name);
+    let repo = entry(name).2;
     tokio::fs::create_dir_all(&dir).await?;
     for file in FILES {
         let path = dir.join(file);
         if path.is_file() {
             continue;
         }
-        let mut resp = reqwest::get(format!("{REPO}/{file}")).await?.error_for_status().context("téléchargement du modèle NMT")?;
+        let mut resp = reqwest::get(format!("https://huggingface.co/{repo}/resolve/main/{file}")).await?.error_for_status().context("téléchargement du modèle NMT")?;
         let total = resp.content_length().unwrap_or(0);
         let tmp = path.with_extension("part");
         let mut out = tokio::fs::File::create(&tmp).await?;
@@ -96,7 +106,7 @@ fn is_lang_token(t: &str) -> bool {
 }
 
 /// Le modèle est chargé une fois et reste en mémoire entre deux vidéos.
-type Engine = (Translator<NllbTokenizer>, Arc<Mutex<&'static str>>);
+type Engine = (PathBuf, Translator<NllbTokenizer>, Arc<Mutex<&'static str>>);
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
 /// Traduit les lignes (bloquant : à appeler depuis `spawn_blocking`).
@@ -114,22 +124,24 @@ pub fn translate_blocking(
     let tgt = nllb_code(target).ok_or_else(|| anyhow!("langue cible non supportée : {target}"))?;
 
     let mut guard = ENGINE.lock().map_err(|_| anyhow!("moteur de traduction indisponible"))?;
-    if guard.is_none() {
+    if guard.as_ref().is_none_or(|(d, _, _)| d != dir) {
+        *guard = None; // libère l'ancien modèle avant d'en charger un autre
         progress(0.0, "Chargement du modèle de traduction…".into());
         let sp = SentencePieceProcessor::open(dir.join("sentencepiece.bpe.model"))?;
         let source = Arc::new(Mutex::new(src));
         let tokenizer = NllbTokenizer { sp, source: source.clone() };
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
         let config = Config { num_threads_per_replica: threads, compute_type: ComputeType::INT8, ..Config::default() };
-        *guard = Some((Translator::with_tokenizer(dir, tokenizer, &config)?, source));
+        *guard = Some((dir.to_path_buf(), Translator::with_tokenizer(dir, tokenizer, &config)?, source));
     }
-    let (engine, source) = guard.as_ref().unwrap();
+    let (_, engine, source) = guard.as_ref().unwrap();
     *source.lock().unwrap_or_else(|e| e.into_inner()) = src;
 
+    // Recherche en faisceau plus large = meilleures traductions pour un coût modeste sur des
+    // lignes courtes. Pas de pénalité de répétition : dans une chanson, elle est voulue.
     let options = TranslationOptions {
-        beam_size: 2,
+        beam_size: 4,
         max_decoding_length: 200,
-        repetition_penalty: 1.1,
         ..Default::default()
     };
     const BATCH: usize = 16;

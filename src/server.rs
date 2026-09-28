@@ -29,6 +29,12 @@ struct Config {
     anthropic_key: Option<String>,
     #[serde(default = "default_model")]
     whisper_model: String,
+    #[serde(default = "default_nmt")]
+    nmt_model: String,
+}
+
+fn default_nmt() -> String {
+    crate::nmt::DEFAULT_MODEL.into()
 }
 
 fn default_model() -> String {
@@ -82,6 +88,9 @@ impl AppState {
         if config.whisper_model.is_empty() {
             config.whisper_model = default_model();
         }
+        if config.nmt_model.is_empty() {
+            config.nmt_model = default_nmt();
+        }
         Self {
             jobs: Default::default(),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -123,7 +132,8 @@ async fn run_setup(st: &AppState, progress: Progress) -> Result<()> {
     whisper::ensure_model(&models, &whisper_model, &wp).await?;
     let p = progress.clone();
     let np: Progress = Arc::new(move |f, s| p(0.5 + 0.5 * f, s));
-    crate::nmt::ensure_model(&models, &np).await?;
+    let nmt_model = st.config.lock().unwrap().nmt_model.clone();
+    crate::nmt::ensure_model(&models, &nmt_model, &np).await?;
     progress(1.0, "Modèles prêts".into());
     Ok(())
 }
@@ -131,11 +141,14 @@ async fn run_setup(st: &AppState, progress: Progress) -> Result<()> {
 fn models_missing(st: &AppState) -> bool {
     let models = st.cache_dir.join("models");
     let whisper_model = st.config.lock().unwrap().whisper_model.clone();
-    !whisper::model_path(&models, &whisper_model).is_file() || !crate::nmt::is_ready(&models)
+    let nmt_model = st.config.lock().unwrap().nmt_model.clone();
+    !whisper::model_path(&models, &whisper_model).is_file() || !crate::nmt::is_ready(&models, &nmt_model)
 }
 
 pub fn router() -> Router {
     let state = AppState::new();
+    // Fichiers temporaires d'une session précédente (audio de repli, sous-titres bruts).
+    let _ = std::fs::remove_dir_all(state.cache_dir.join("work"));
     if models_missing(&state) {
         let st = state.clone();
         *st.setup.lock().unwrap() = (true, 0.0, "Installation des modèles…".into());
@@ -160,6 +173,7 @@ pub fn router() -> Router {
         .route("/api/media/{key}/{kind}", get(media))
         .route("/api/export", post(export_srt))
         .route("/api/log", post(client_log))
+        .route("/api/translate", post(translate_text))
         .fallback(static_file)
         .with_state(state)
 }
@@ -188,11 +202,12 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
     Json(json!({
         "ytdlp": youtube::find_bin("yt-dlp").is_some(),
         "ffmpeg": youtube::find_bin("ffmpeg").is_some(),
-        "whisper": youtube::find_bin("whisper-cli").is_some(),
+        "whisper": true,
         "claude_key": st.api_key().is_some(),
         "whisper_model": cfg.whisper_model,
         "whisper_model_ready": whisper::model_path(&models, &cfg.whisper_model).is_file(),
-        "nmt_ready": crate::nmt::is_ready(&models),
+        "nmt_ready": crate::nmt::is_ready(&models, &cfg.nmt_model),
+        "nmt_model": cfg.nmt_model,
         "setup": { "running": setup.0, "progress": setup.1, "message": setup.2 },
         "langs": translate::LANGS.iter().map(|(c, n)| json!({"code": c, "name": n})).collect::<Vec<_>>(),
     }))
@@ -202,6 +217,7 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
 struct SettingsReq {
     anthropic_key: Option<String>,
     whisper_model: Option<String>,
+    nmt_model: Option<String>,
 }
 
 async fn save_settings(State(st): State<AppState>, Json(req): Json<SettingsReq>) -> Response {
@@ -209,6 +225,9 @@ async fn save_settings(State(st): State<AppState>, Json(req): Json<SettingsReq>)
         let mut cfg = st.config.lock().unwrap();
         if let Some(k) = req.anthropic_key {
             cfg.anthropic_key = Some(k.trim().to_string()).filter(|k| !k.is_empty());
+        }
+        if let Some(m) = req.nmt_model.filter(|m| crate::nmt::MODELS.iter().any(|(n, _, _)| n == m)) {
+            cfg.nmt_model = m;
         }
         if let Some(m) = req.whisper_model.filter(|m| ["tiny", "base", "small", "medium", "large-v3-turbo-q5_0"].contains(&m.as_str())) {
             cfg.whisper_model = m;
@@ -340,8 +359,9 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     }
     let work = st.cache_dir.join("work");
     let cache_file = st.cache_dir.join("subs").join(format!(
-        "{id}_{}_{}_{}_{}_{}_{}.json",
-        req.mode, req.source, target, req.translator, req.voice, req.addressee
+        "{id}_{}_{}_{}_{}_{}_{}{}.json",
+        req.mode, req.source, target, req.translator, req.voice, req.addressee,
+        if req.translator == "local" { format!("_{}", st.config.lock().unwrap().nmt_model) } else { String::new() }
     ));
     if !req.refresh {
         if let Ok(s) = tokio::fs::read_to_string(&cache_file).await {
@@ -376,8 +396,9 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
         None => {
             // Avec le NMT local, chaque segment Whisper est traduit et affiché dès qu'il sort.
             let models = st.cache_dir.join("models");
-            let live = (req.translator == "local" && crate::nmt::is_ready(&models))
-                .then(|| start_live_nmt(crate::nmt::model_dir(&models), &req.source, target, publish.clone()));
+            let nmt_model = st.config.lock().unwrap().nmt_model.clone();
+            let live = (req.translator == "local" && crate::nmt::is_ready(&models, &nmt_model))
+                .then(|| start_live_nmt(crate::nmt::model_dir(&models, &nmt_model), &req.source, target, publish.clone()));
             let result = transcribe_video(st, &id, req, &work, &progress, live.as_ref().map(|(l, _)| l)).await;
             if let Some((_, task)) = live {
                 task.abort();
@@ -417,7 +438,8 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
             "local" => {
                 let p = progress.clone();
                 let dl: Progress = Arc::new(move |f, s| p(0.6 + 0.1 * f, s));
-                let dir = crate::nmt::ensure_model(&st.cache_dir.join("models"), &dl).await?;
+                let nmt_model = st.config.lock().unwrap().nmt_model.clone();
+                let dir = crate::nmt::ensure_model(&st.cache_dir.join("models"), &nmt_model, &dl).await?;
                 let p = progress.clone();
                 let sub: Progress = Arc::new(move |f, s| p(0.7 + 0.29 * f, s));
                 let lines: Vec<String> = cues.iter().map(|c| c.orig.clone()).collect();
@@ -437,7 +459,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                 for (c, t) in cues.iter_mut().zip(out) {
                     c.text = t;
                 }
-                translator = "NMT local (NLLB-200)".into();
+                translator = format!("NMT local (NLLB {nmt_model})");
             }
             engine => {
                 let engine = if engine == "claude" { Engine::Claude } else { Engine::Google };
@@ -516,7 +538,7 @@ async fn transcribe_video(
         if meta.is_live.unwrap_or(false) {
             bail!("Direct en cours sans sous-titres YouTube : Whisper a besoin de la vidéo complète (réessayez à la fin du live)");
         }
-        let (whisper_cues, detected) = whisper_pipeline(st, id, &req.source, work, progress, live).await?;
+        let (whisper_cues, detected) = whisper_pipeline(st, id, &req.source, work, progress, live, meta.duration).await?;
         cues = whisper_cues;
         if source_lang == "auto" {
             if let Some(lang) = detected {
@@ -545,24 +567,85 @@ async fn whisper_pipeline(
     work: &std::path::Path,
     progress: &Progress,
     live: Option<&whisper::Live>,
+    duration: Option<f64>,
 ) -> Result<(Vec<Cue>, Option<String>)> {
     let size = st.config.lock().unwrap().whisper_model.clone();
     let p = progress.clone();
     let model_progress: Progress = Arc::new(move |f, s| p(0.05 + 0.15 * f, s));
     let model = whisper::ensure_model(&st.cache_dir.join("models"), &size, &model_progress).await?;
 
-    progress(0.2, "Téléchargement de l'audio…".into());
-    let audio = youtube::download_audio(id, work).await?;
-    progress(0.25, "Conversion audio…".into());
-    let wav = whisper::to_wav(&audio).await?;
-    let _ = tokio::fs::remove_file(&audio).await;
+    // L'audio est lu en flux par ffmpeg et transcrit morceau par morceau pendant qu'il arrive.
+    progress(0.2, "Connexion au flux audio…".into());
+    let stream = Arc::new(whisper::PcmStream::default());
+    let feeder = start_audio_feed(id.to_string(), work.to_path_buf(), stream.clone());
 
     let p = progress.clone();
-    let tr_progress: Progress = Arc::new(move |f, s| p(0.25 + 0.35 * f, s));
-    let cues = whisper::transcribe(&model, &wav, source, &tr_progress, live).await;
-    let _ = tokio::fs::remove_file(&wav).await;
-    let (cues, lang) = cues?;
+    let tr_progress: Progress = Arc::new(move |f, s| p(0.2 + 0.4 * f, s));
+    let (source, live, s2) = (source.to_string(), live.cloned(), stream.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        whisper::transcribe_stream(&model, &s2, &source, duration, &tr_progress, live.as_ref())
+    })
+    .await;
+    feeder.abort();
+    let (cues, lang) = result??;
     Ok((subs::merge_short(cues), lang))
+}
+
+/// Alimente `stream` en PCM 16 kHz : ffmpeg lit directement le flux audio de YouTube.
+/// Si la lecture directe échoue, on retombe sur le téléchargement complet puis le décodage.
+fn start_audio_feed(id: String, work: std::path::PathBuf, stream: Arc<whisper::PcmStream>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let direct = async {
+            let url = youtube::audio_stream_url(&id).await?;
+            let ffmpeg = youtube::find_bin("ffmpeg").ok_or_else(|| anyhow!("ffmpeg introuvable — brew install ffmpeg"))?;
+            let mut child = tokio::process::Command::new(ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-i", &url, "-ar", "16000", "-ac", "1", "-f", "f32le", "-"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut out = child.stdout.take().unwrap();
+            let mut buf = vec![0u8; 1 << 16];
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
+                use tokio::io::AsyncReadExt;
+                let n = out.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                carry.extend_from_slice(&buf[..n]);
+                let whole = carry.len() / 4 * 4;
+                let samples: Vec<f32> =
+                    carry[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                carry.drain(..whole);
+                stream.push(&samples);
+            }
+            if !child.wait().await?.success() && stream.len() == 0 {
+                bail!("ffmpeg n'a pas pu lire le flux audio");
+            }
+            anyhow::Ok(())
+        };
+        match direct.await {
+            Ok(()) => stream.finish(None),
+            Err(_) if stream.len() == 0 => {
+                // Repli : téléchargement du fichier audio puis décodage complet.
+                let fallback = async {
+                    let audio = youtube::download_audio(&id, &work).await?;
+                    let pcm = whisper::decode_pcm(&audio).await;
+                    let _ = tokio::fs::remove_file(&audio).await;
+                    anyhow::Ok(pcm?)
+                };
+                match fallback.await {
+                    Ok(pcm) => {
+                        stream.push(&pcm);
+                        stream.finish(None);
+                    }
+                    Err(e) => stream.finish(Some(format!("{e:#}"))),
+                }
+            }
+            Err(e) => stream.finish(Some(format!("{e:#}"))),
+        }
+    })
 }
 
 /// Traducteur « au fil de l'eau » : reçoit les segments de Whisper, les traduit par petits
@@ -802,6 +885,36 @@ async fn search(Query(q): Query<SearchReq>) -> Response {
     match youtube::search(&q.q, 15).await {
         Ok(hits) => Json(hits).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct TranslateReq {
+    lines: Vec<String>,
+    source: String,
+    target: String,
+    /// Modèle NMT à utiliser ; par défaut celui des réglages.
+    model: Option<String>,
+}
+
+/// Traduit du texte libre avec le NMT local (tests et comparaisons de modèles).
+async fn translate_text(State(st): State<AppState>, Json(req): Json<TranslateReq>) -> Response {
+    let name = req.model.unwrap_or_else(|| st.config.lock().unwrap().nmt_model.clone());
+    let models = st.cache_dir.join("models");
+    if !crate::nmt::is_ready(&models, &name) {
+        return err(StatusCode::CONFLICT, format!("modèle NMT {name} non installé"));
+    }
+    let dir = crate::nmt::model_dir(&models, &name);
+    let quiet: Progress = Arc::new(|_, _| {});
+    let started = std::time::Instant::now();
+    let res = tokio::task::spawn_blocking(move || {
+        crate::nmt::translate_blocking(&dir, &req.lines, &req.source, &req.target, &quiet, &|_| {})
+    })
+    .await;
+    match res {
+        Ok(Ok(out)) => Json(json!({ "model": name, "ms": started.elapsed().as_millis() as u64, "lines": out })).into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 

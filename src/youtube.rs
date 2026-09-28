@@ -80,6 +80,8 @@ pub struct Meta {
     pub automatic_captions: HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub is_live: Option<bool>,
+    #[serde(default)]
+    pub duration: Option<f64>,
 }
 
 pub async fn metadata(id: &str) -> Result<Meta> {
@@ -157,6 +159,15 @@ pub async fn download_track(id: &str, track: &Track, dir: &Path) -> Result<Vec<C
         }
     }
     bail!("YouTube n'a renvoyé aucun fichier pour la piste « {} »", track.key)
+}
+
+/// URL du flux audio seul (HLS en priorité : c'est celui que YouTube sert sans 403),
+/// que ffmpeg peut lire directement pendant que Whisper travaille.
+pub async fn audio_stream_url(id: &str) -> Result<String> {
+    let mut cmd = ytdlp()?;
+    cmd.args(["-g", "--no-warnings", "--no-playlist", "-f", "ba[protocol=m3u8_native]/ba/b"]).arg(watch_url(id));
+    let out = run(cmd).await?;
+    out.lines().map(str::trim).find(|l| l.starts_with("http")).map(String::from).ok_or_else(|| anyhow!("aucun flux audio"))
 }
 
 /// Télécharge la piste audio (pour Whisper). Renvoie le chemin du fichier.

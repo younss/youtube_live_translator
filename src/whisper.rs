@@ -1,12 +1,13 @@
-//! Transcription locale avec whisper.cpp quand YouTube ne fournit aucun sous-titre.
+//! Transcription locale avec whisper.cpp **compilé dans l'app** (Metal) quand YouTube ne
+//! fournit aucun sous-titre. Le modèle est chargé une seule fois et partagé par tous les jobs.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::subs::Cue;
 use crate::translate::Progress;
@@ -41,195 +42,260 @@ pub async fn ensure_model(models_dir: &Path, size: &str, progress: &Progress) ->
     Ok(path)
 }
 
-/// whisper-cli veut du WAV 16 kHz mono.
-pub async fn to_wav(input: &Path) -> Result<PathBuf> {
+/// Décode l'audio en PCM 16 kHz mono f32, le format que whisper.cpp attend.
+/// (ffmpeg ne sert qu'à cette conversion : quelques secondes, quelques Mo de mémoire.)
+pub async fn decode_pcm(input: &Path) -> Result<Vec<f32>> {
     let ffmpeg = find_bin("ffmpeg").ok_or_else(|| anyhow!("ffmpeg introuvable — brew install ffmpeg"))?;
-    let out = input.with_extension("wav");
-    let status = Command::new(ffmpeg)
-        .args(["-y", "-loglevel", "error", "-i"])
+    let out = Command::new(ffmpeg)
+        .args(["-nostdin", "-loglevel", "error", "-i"])
         .arg(input)
-        .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
-        .arg(&out)
-        .status()
+        .args(["-ar", "16000", "-ac", "1", "-f", "f32le", "-"])
+        .kill_on_drop(true)
+        .output()
         .await?;
-    if !status.success() {
-        bail!("ffmpeg n'a pas pu convertir l'audio");
+    if !out.status.success() {
+        bail!("ffmpeg n'a pas pu décoder l'audio : {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok(out)
+    Ok(out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
 }
 
-/// Transcrit `wav` depuis `offset` secondes (sur `duration` secondes si précisé).
 /// Rappels pour afficher la transcription au fil de l'eau (avant la fin de Whisper).
 #[derive(Clone)]
 pub struct Live {
     /// Chaque segment dès que Whisper l'écrit.
     pub on_segment: Arc<dyn Fn(Cue) + Send + Sync>,
-    /// Langue détectée (si la source est sur « Auto »), annoncée dès le début.
+    /// Langue détectée (si la source est sur « Auto »), annoncée avant la transcription.
     pub on_language: Arc<dyn Fn(String) + Send + Sync>,
 }
 
-async fn run_whisper(
-    model: &Path,
-    wav: &Path,
+/// Le modèle (~550 Mo) reste chargé entre deux vidéos au lieu d'être relu à chaque fois.
+static MODEL: Mutex<Option<(PathBuf, Arc<WhisperContext>)>> = Mutex::new(None);
+
+fn load(model: &Path) -> Result<Arc<WhisperContext>> {
+    let mut guard = MODEL.lock().map_err(|_| anyhow!("Whisper indisponible"))?;
+    if let Some((path, ctx)) = guard.as_ref() {
+        if path == model {
+            return Ok(ctx.clone());
+        }
+    }
+    whisper_rs::install_logging_hooks(); // silencieux : whisper.cpp est très bavard sur stderr
+    let params = WhisperContextParameters { use_gpu: true, flash_attn: true, ..Default::default() };
+    let path = model.to_str().ok_or_else(|| anyhow!("chemin du modèle invalide"))?;
+    let ctx = Arc::new(WhisperContext::new_with_params(path, params).map_err(|e| anyhow!("modèle Whisper : {e}"))?);
+    *guard = Some((model.to_path_buf(), ctx.clone()));
+    Ok(ctx)
+}
+
+fn threads() -> i32 {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) as i32
+}
+
+/// Détecte la langue parlée sur un extrait (on évite le tout début, souvent instrumental).
+fn detect_language(ctx: &WhisperContext, pcm: &[f32]) -> Option<String> {
+    let mut state = ctx.create_state().ok()?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("auto"));
+    params.set_detect_language(true);
+    params.set_n_threads(threads());
+    silence(&mut params);
+    let secs = pcm.len() as f64 / 16000.0;
+    params.set_offset_ms((secs / 3.0).min(30.0) as i32 * 1000);
+    state.full(params, pcm).ok()?;
+    whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_string)
+}
+
+fn silence(params: &mut FullParams) {
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+}
+
+/// Une passe de transcription sur `pcm`, depuis `offset` secondes (sur `duration` si précisé).
+fn run_pass(
+    ctx: &WhisperContext,
+    pcm: &[f32],
     lang: &str,
     offset: f64,
     duration: Option<f64>,
-    tag: &str,
-    progress: Option<&Progress>,
-    live: Option<&Live>,
-) -> Result<(Vec<Cue>, Option<String>)> {
-    let bin = find_bin("whisper-cli").ok_or_else(|| anyhow!("whisper-cli introuvable — brew install whisper-cpp"))?;
-    let prefix = PathBuf::from(format!("{}{tag}", wav.with_extension("").display()));
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
-    let mut child = Command::new(bin)
-        .arg("-m")
-        .arg(model)
-        .arg("-f")
-        .arg(wav)
-        // -mc 0 évite les boucles de répétition sur la musique, -sns retire les « ♪ ».
-        .args(["-l", lang, "-oj", "-pp", "-mc", "0", "-sns", "-t", &threads.to_string()])
-        .args(["-ot", &((offset * 1000.0) as u64).to_string()])
-        .args(["-d", &duration.map_or(0, |d| (d * 1000.0) as u64).to_string(), "-of"])
-        .arg(&prefix)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-
-    // Whisper écrit chaque segment sur stdout dès qu'il est décodé :
-    // « [00:00:05.000 --> 00:00:09.000]  texte ».
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let live_out = live.cloned();
-    let reader = tokio::spawn(async move {
-        let mut lines = stdout.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let (Some(live), Some(cue)) = (&live_out, parse_segment_line(&line)) {
+    progress: Option<Progress>,
+    live: Option<Live>,
+) -> Result<Vec<Cue>> {
+    let mut state = ctx.create_state().map_err(|e| anyhow!("Whisper : {e}"))?;
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 });
+    params.set_language(Some(lang));
+    params.set_n_threads(threads());
+    // Pas de contexte entre fenêtres : évite les boucles de répétition sur la musique ;
+    // suppress_nst retire les « ♪ » et autres jetons non verbaux.
+    params.set_n_max_text_ctx(0);
+    params.set_suppress_nst(true);
+    params.set_offset_ms((offset * 1000.0) as i32);
+    params.set_duration_ms(duration.map_or(0, |d| (d * 1000.0) as i32));
+    silence(&mut params);
+    if let Some(progress) = progress {
+        params.set_progress_callback_safe(move |pct: i32| progress(pct as f32 / 100.0, format!("Transcription Whisper {pct}%")));
+    }
+    if let Some(live) = live {
+        params.set_segment_callback_safe_lossy(move |seg: whisper_rs::SegmentCallbackData| {
+            if let Some(cue) = to_cue(seg.start_timestamp, seg.end_timestamp, &seg.text) {
                 (live.on_segment)(cue);
             }
-        }
-    });
-
-    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-    let mut tail = Vec::new();
-    while let Some(line) = lines.next_line().await? {
-        // Format : "whisper_print_progress_callback: progress =  45%"
-        if let Some(pct) = line.split("progress =").nth(1).and_then(|p| p.trim().trim_end_matches('%').parse::<f32>().ok()) {
-            if let Some(progress) = progress {
-                progress(pct / 100.0, format!("Transcription Whisper {pct:.0}%"));
-            }
-        } else if let Some(l) = line.split("auto-detected language:").nth(1) {
-            if let (Some(live), Some(code)) = (live, l.split_whitespace().next()) {
-                (live.on_language)(code.to_string());
-            }
-        } else {
-            tail.push(line);
-            if tail.len() > 5 {
-                tail.remove(0);
-            }
-        }
+        });
     }
-    let _ = reader.await;
-    if !child.wait().await?.success() {
-        bail!("whisper-cli a échoué : {}", tail.join(" | "));
-    }
-
-    #[derive(Deserialize)]
-    struct Out {
-        transcription: Vec<Seg>,
-        #[serde(default)]
-        result: Option<Detected>,
-    }
-    #[derive(Deserialize)]
-    struct Detected {
-        language: String,
-    }
-    #[derive(Deserialize)]
-    struct Seg {
-        offsets: Offsets,
-        text: String,
-    }
-    #[derive(Deserialize)]
-    struct Offsets {
-        from: f64,
-        to: f64,
-    }
-    let json_path = PathBuf::from(format!("{}.json", prefix.display()));
-    let out: Out = serde_json::from_str(&tokio::fs::read_to_string(&json_path).await?)?;
-    let _ = tokio::fs::remove_file(json_path).await;
-    let detected = out.result.map(|r| r.language).filter(|l| !l.is_empty() && l != "auto");
-    let cues = out
-        .transcription
-        .into_iter()
-        .filter(|s| !s.text.trim().is_empty() && !is_hallucination(&s.text))
-        .map(|s| {
-            let text = s.text.trim().to_string();
-            Cue { start: s.offsets.from / 1000.0, end: s.offsets.to / 1000.0, orig: text.clone(), text }
-        })
-        .collect();
-    Ok((cues, detected))
+    state.full(params, pcm).map_err(|e| anyhow!("Whisper : {e}"))?;
+    Ok(state
+        .as_iter()
+        .filter_map(|seg| to_cue(seg.start_timestamp(), seg.end_timestamp(), &seg.to_str_lossy().ok()?))
+        .collect())
 }
 
-fn parse_segment_line(line: &str) -> Option<Cue> {
-    let rest = line.trim_start().strip_prefix('[')?;
-    let (times, text) = rest.split_once(']')?;
-    let (a, b) = times.split_once("-->")?;
-    let ts = |t: &str| -> Option<f64> {
-        let mut parts = t.trim().split(':').rev();
-        let s: f64 = parts.next()?.parse().ok()?;
-        let m: f64 = parts.next().unwrap_or("0").parse().ok()?;
-        let h: f64 = parts.next().unwrap_or("0").parse().ok()?;
-        Some(h * 3600.0 + m * 60.0 + s)
-    };
+/// Les horodatages de whisper.cpp sont en centièmes de seconde.
+fn to_cue(t0: i64, t1: i64, text: &str) -> Option<Cue> {
     let text = text.trim().to_string();
     if text.is_empty() || is_hallucination(&text) {
         return None;
     }
-    Some(Cue { start: ts(a)?, end: ts(b)?, orig: text.clone(), text })
+    Some(Cue { start: t0 as f64 / 100.0, end: t1 as f64 / 100.0, orig: text.clone(), text })
 }
 
-/// Whisper découpe l'audio en fenêtres de 30 s. Quand une fenêtre mêle surtout musique et
-/// voix (intro, pont instrumental d'une chanson), il y invente du texte (filtré ensuite) et
-/// perd les paroles de toute la fenêtre. On repère ces trous et on les retranscrit par de
-/// courtes passes qui démarrent un peu plus loin, pour décaler la fenêtre.
-pub async fn transcribe(
+/// Tampon audio alimenté au fil de l'eau (ffmpeg lit le flux YouTube) et consommé par
+/// Whisper morceau par morceau : pas besoin d'attendre tout l'audio pour commencer.
+#[derive(Default)]
+pub struct PcmStream {
+    state: Mutex<PcmState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct PcmState {
+    samples: Vec<f32>,
+    done: bool,
+    error: Option<String>,
+}
+
+impl PcmStream {
+    pub fn push(&self, samples: &[f32]) {
+        self.state.lock().unwrap().samples.extend_from_slice(samples);
+        self.ready.notify_all();
+    }
+
+    pub fn finish(&self, error: Option<String>) {
+        let mut st = self.state.lock().unwrap();
+        st.done = true;
+        st.error = error;
+        self.ready.notify_all();
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().samples.len()
+    }
+
+    /// Attend qu'au moins `n` échantillons soient là (ou la fin du flux) et renvoie une copie
+    /// de `from..min(n, dispo)` ainsi que « le flux est-il terminé ».
+    fn wait_slice(&self, from: usize, n: usize) -> Result<(Vec<f32>, bool)> {
+        let mut st = self.state.lock().unwrap();
+        while st.samples.len() < n && !st.done {
+            st = self.ready.wait(st).unwrap();
+        }
+        if let Some(e) = &st.error {
+            if st.samples.len() <= from {
+                bail!("flux audio : {e}");
+            }
+        }
+        let end = n.min(st.samples.len());
+        let at_end = st.done && end == st.samples.len();
+        Ok((st.samples[from.min(end)..end].to_vec(), at_end))
+    }
+}
+
+const RATE: usize = 16_000;
+const WINDOW: usize = 30 * RATE;
+
+/// Transcrit le flux audio morceau par morceau (bloquant : à appeler depuis `spawn_blocking`).
+/// Chaque segment est transmis à `live` dès qu'il est sûr (pas coupé en fin de morceau).
+/// Renvoie aussi la langue détectée quand la source est sur « Auto ».
+///
+/// Quand une fenêtre de 30 s est surtout instrumentale (intro, pont d'une chanson), Whisper y
+/// invente du texte (filtré) et perd les paroles de la fenêtre : on la relance alors décalée
+/// de quelques secondes, ce qui suffit en général à retrouver la voix.
+pub fn transcribe_stream(
     model: &Path,
-    wav: &Path,
+    stream: &PcmStream,
     lang: &str,
+    duration: Option<f64>,
     progress: &Progress,
     live: Option<&Live>,
 ) -> Result<(Vec<Cue>, Option<String>)> {
-    let (mut cues, detected) = run_whisper(model, wav, lang, 0.0, None, "", Some(progress), live).await?;
-    // La langue détectée sert aussi aux passes de réparation (plus fiables avec une langue fixe).
-    let probe_lang = detected.clone().filter(|_| lang == "auto").unwrap_or_else(|| lang.to_string());
-
-    const GAP: f64 = 10.0;
-    let mut gaps: Vec<(f64, f64)> = Vec::new();
-    let first = cues.first().map_or(0.0, |c| c.start);
-    if first > 6.0 {
-        gaps.push((0.0, first));
-    }
-    gaps.extend(cues.windows(2).filter(|w| w[1].start - w[0].end > GAP).map(|w| (w[0].end, w[1].start)));
-
-    for (n, (from, to)) in gaps.iter().copied().enumerate() {
-        progress(0.99, format!("Recherche des paroles manquantes ({}/{})…", n + 1, gaps.len()));
-        let mut offset = from + 2.0;
-        while offset < to - 1.0 {
-            let (probe, _) = run_whisper(model, wav, &probe_lang, offset, Some(to - offset + 2.0), ".gap", None, None).await?;
-            let found: Vec<Cue> = probe.into_iter().filter(|c| c.start >= from - 0.3 && c.start < to - 0.3).collect();
-            if !found.is_empty() {
-                for mut c in found {
-                    c.end = c.end.min(to);
-                    if let Some(live) = live {
-                        (live.on_segment)(c.clone());
-                    }
-                    cues.push(c);
-                }
-                break;
-            }
-            offset += 3.0;
+    progress(0.0, "Chargement de Whisper…".into());
+    let ctx = load(model)?;
+    let mut detected = None;
+    let lang = if lang == "auto" {
+        progress(0.0, "Détection de la langue…".into());
+        // 40 s suffisent ; on évite les 10 premières, souvent instrumentales.
+        let (pcm, _) = stream.wait_slice(0, 40 * RATE)?;
+        let skip = if pcm.len() > 20 * RATE { 10 * RATE } else { 0 };
+        detected = detect_language(&ctx, &pcm[skip..]);
+        if let (Some(live), Some(l)) = (live, &detected) {
+            (live.on_language)(l.clone());
         }
+        detected.clone().unwrap_or_else(|| "auto".into())
+    } else {
+        lang.to_string()
+    };
+
+    let total = duration.map(|d| (d * RATE as f64) as usize);
+    let mut cues: Vec<Cue> = Vec::new();
+    let mut pos = 0usize;
+    let mut misses = 0;
+    loop {
+        let (pcm, at_end) = stream.wait_slice(pos, pos + WINDOW)?;
+        if pcm.len() < RATE / 2 {
+            break;
+        }
+        let base = pos as f64 / RATE as f64;
+        let segs = run_pass(&ctx, &pcm, &lang, 0.0, None, None, None)?;
+        let slice_end = pcm.len() as f64 / RATE as f64;
+        // Hors du dernier morceau, on garde la fin pour le morceau suivant : un segment qui
+        // touche la limite est peut-être coupé au milieu d'un mot.
+        let keep: Vec<Cue> = segs
+            .into_iter()
+            .filter(|c| at_end || c.end < slice_end - 1.0)
+            .map(|c| Cue { start: c.start + base, end: c.end + base, ..c })
+            .collect();
+
+        let next = if let Some(last) = keep.last() {
+            misses = 0;
+            ((last.end * RATE as f64) as usize).max(pos + RATE)
+        } else if misses < 8 {
+            // Rien d'exploitable : même zone, fenêtre décalée de 4 s (jusqu'à ~30 s plus loin).
+            misses += 1;
+            pos + 4 * RATE
+        } else {
+            misses = 0;
+            pos + WINDOW - RATE
+        };
+        for c in keep {
+            if let Some(live) = live {
+                (live.on_segment)(c.clone());
+            }
+            cues.push(c);
+        }
+        if at_end && next >= stream.len() {
+            break;
+        }
+        pos = next;
+        let known = total.unwrap_or_else(|| stream.len()).max(1);
+        let pct = (pos as f32 / known as f32).min(1.0);
+        progress(pct, format!("Transcription Whisper {:.0}%", pct * 100.0));
     }
     cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+    cues.dedup_by(|b, a| (b.start - a.start).abs() < 0.2 && b.orig == a.orig);
+    // Whisper ne sert qu'une fois par vidéo (la transcription est ensuite en cache) :
+    // on libère le modèle tout de suite. Un job concurrent garde sa copie `Arc` jusqu'à sa fin.
+    drop(ctx);
+    if let Ok(mut guard) = MODEL.lock() {
+        *guard = None;
+    }
     Ok((cues, detected))
 }
 
@@ -252,16 +318,5 @@ mod tests {
         assert!(super::is_hallucination("Sous-titres réalisés par la communauté d'Amara.org"));
         assert!(super::is_hallucination("♪"));
         assert!(!super::is_hallucination("Bonjour à tous"));
-    }
-}
-
-#[cfg(test)]
-mod segment_tests {
-    #[test]
-    fn parses_whisper_stdout_line() {
-        let c = super::parse_segment_line("[00:01:05.500 --> 00:01:09.000]   Bonjour tout le monde").unwrap();
-        assert!((c.start - 65.5).abs() < 1e-9 && (c.end - 69.0).abs() < 1e-9);
-        assert_eq!(c.orig, "Bonjour tout le monde");
-        assert!(super::parse_segment_line("whisper_init: loading model").is_none());
     }
 }

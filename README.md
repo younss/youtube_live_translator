@@ -5,7 +5,7 @@ A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It pl
 ## Install
 
 ```bash
-brew install yt-dlp ffmpeg whisper-cpp
+brew install yt-dlp ffmpeg
 ./scripts/install.sh        # builds the app, copies it into /Applications and downloads the models
 ```
 
@@ -21,8 +21,8 @@ brew install yt-dlp ffmpeg whisper-cpp
 | Step | Tool |
 |---|---|
 | Playback | **Native** player: yt-dlp resolves the H.264 + AAC streams, which play in synced `<video>`/`<audio>` elements. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
-| Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise a **local Whisper** transcription (whisper.cpp; the model downloads automatically on first use) |
-| Translation | **Local NMT** by default: NLLB-200 600M int8 running in CTranslate2, compiled into the app. It's offline, needs no key, and uses about 630 MB on disk. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
+| Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise **Whisper compiled into the app** (whisper.cpp + Metal). The audio is read as a stream by ffmpeg and transcribed in 30 s chunks as it arrives, with nothing downloaded to disk. |
+| Translation | **Local NMT** by default: NLLB-200 int8, 1.3B (better quality) or 600M (lighter) to choose in ⚙ Settings, running in CTranslate2, compiled into the app. It's offline, needs no key, and uses about 630 MB on disk. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
 | Progressive display | With the local NMT, each Whisper segment is translated and shown as soon as it's transcribed. Changing the target language doesn't re-run Whisper: the transcript is cached separately. |
 | Gender and proper names | With Claude: the **VOIX** (who is speaking) and **À QUI** (who is addressed or talked about) choices set the grammatical agreement (Arabic أنتَ/أنتِ, French agreement…). Proper names are kept or transliterated. Google translates line by line and can't take this into account. |
 

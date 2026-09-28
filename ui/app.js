@@ -90,6 +90,7 @@ async function refreshStatus() {
     $("statusDeps").innerHTML = [dep(s.ytdlp, "yt-dlp"), dep(s.ffmpeg, "ffmpeg"), dep(s.whisper, "whisper"),
       dep(s.nmt_ready, "NMT local"), dep(s.claude_key, "clé Claude")].join(" &nbsp; ");
     $("whisperModel").value = s.whisper_model;
+    $("nmtModel").value = s.nmt_model;
     if (s.setup && (s.setup.running || s.setup.message.startsWith("Échec"))) {
       setProgress(s.setup.progress, s.setup.message.toUpperCase(), s.setup.running ? "busy" : "error");
       if (s.setup.running) setTimeout(refreshStatus, 1500);
@@ -759,7 +760,7 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
 $("btnSettings").onclick = async () => { await refreshStatus(); $("apiKey").value = ""; $("settings").showModal(); };
 $("settings").addEventListener("close", async () => {
   if ($("settings").returnValue !== "save") return;
-  const body = { whisper_model: $("whisperModel").value };
+  const body = { whisper_model: $("whisperModel").value, nmt_model: $("nmtModel").value };
   if ($("apiKey").value.trim()) body.anthropic_key = $("apiKey").value.trim();
   $("apiKey").value = "";
   try { await api("/api/settings", { method: "POST", body: JSON.stringify(body) }); toast("Réglages enregistrés"); refreshStatus(); }
