@@ -27,3 +27,6 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

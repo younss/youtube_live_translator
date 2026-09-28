@@ -4676,6 +4676,7 @@ dependencies = [
  "muda",
  "reqwest",
  "rust-embed",
+ "security-framework",
  "sentencepiece",
  "serde",
  "serde_json",

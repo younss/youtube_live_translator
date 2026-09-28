@@ -108,6 +108,26 @@ fn is_lang_token(t: &str) -> bool {
 /// Le modèle est chargé une fois et reste en mémoire entre deux vidéos.
 type Engine = (PathBuf, Translator<NllbTokenizer>, Arc<Mutex<&'static str>>);
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+static LAST_USE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Libère le modèle (~0,7–1,4 Go) après 5 min sans traduction ; il se recharge en ~1 s.
+fn start_idle_reaper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let idle = LAST_USE.lock().ok().and_then(|t| *t).is_some_and(|t| t.elapsed().as_secs() > 300);
+            if idle {
+                // try_lock : on ne libère jamais un modèle en train de traduire.
+                if let Ok(mut guard) = ENGINE.try_lock() {
+                    if guard.take().is_some() {
+                        *LAST_USE.lock().unwrap() = None;
+                    }
+                }
+            }
+        });
+    });
+}
 
 /// Traduit les lignes (bloquant : à appeler depuis `spawn_blocking`).
 /// `on_chunk(n)` est appelé avec toutes les traductions déjà prêtes après chaque lot,
@@ -123,6 +143,7 @@ pub fn translate_blocking(
     let src = nllb_code(source).ok_or_else(|| anyhow!("langue source inconnue : choisissez-la dans « DE »"))?;
     let tgt = nllb_code(target).ok_or_else(|| anyhow!("langue cible non supportée : {target}"))?;
 
+    start_idle_reaper();
     let mut guard = ENGINE.lock().map_err(|_| anyhow!("moteur de traduction indisponible"))?;
     if guard.as_ref().is_none_or(|(d, _, _)| d != dir) {
         *guard = None; // libère l'ancien modèle avant d'en charger un autre
@@ -157,5 +178,6 @@ pub fn translate_blocking(
         on_chunk(&out);
         progress((i + 1) as f32 / chunks.len() as f32, format!("Traduction locale {}/{}", i + 1, chunks.len()));
     }
+    *LAST_USE.lock().unwrap() = Some(std::time::Instant::now());
     Ok(out)
 }

@@ -34,7 +34,15 @@ enum Ui {
 
 /// Démarre le serveur sur un port fixe (pour que le localStorage de l'interface persiste),
 /// ou sur un port libre si celui-ci est occupé.
-fn start_server() -> Result<SocketAddr> {
+/// Jeton de session aléatoire (256 bits) tiré à chaque lancement : seul l'app le connaît.
+fn session_token() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn start_server(token: String) -> Result<SocketAddr> {
     let std_listener = std::net::TcpListener::bind(("127.0.0.1", PREFERRED_PORT))
         .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))?;
     std_listener.set_nonblocking(true)?;
@@ -43,7 +51,7 @@ fn start_server() -> Result<SocketAddr> {
         let rt = tokio::runtime::Runtime::new().expect("runtime tokio");
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
-            axum::serve(listener, server::router()).await.expect("serveur");
+            axum::serve(listener, server::router(token, addr.port())).await.expect("serveur");
         });
     });
     Ok(addr)
@@ -66,8 +74,12 @@ fn main() -> Result<()> {
         println!("Modèles installés.");
         return Ok(());
     }
-    let addr = start_server()?;
-    let url = format!("http://{addr}/");
+    let token = session_token()?;
+    let addr = start_server(token.clone())?;
+    let origin = format!("http://{addr}");
+    // Le jeton n'apparaît que dans cette première URL : le serveur l'échange contre un cookie
+    // HttpOnly puis redirige vers « / ».
+    let url = format!("{origin}/?t={token}");
 
     if std::env::args().any(|a| a == "--server") {
         println!("Serveur prêt : {url}");
@@ -91,6 +103,19 @@ fn main() -> Result<()> {
         .with_url(&url)
         .with_autoplay(true)
         .with_devtools(cfg!(debug_assertions))
+        // La fenêtre ne charge que l'app et le lecteur YouTube (iframe de secours) ;
+        // tout autre site est refusé, il n'aurait donc jamais accès au canal IPC.
+        .with_navigation_handler({
+            let origin = origin.clone();
+            move |url: String| is_allowed_navigation(&origin, &url)
+        })
+        // Les liens « nouvelle fenêtre » (ex. logo YouTube du lecteur) s'ouvrent dans le navigateur.
+        .with_new_window_req_handler(|url: String, _| {
+            if url.starts_with("https://") {
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+            }
+            wry::NewWindowResponse::Deny
+        })
         .with_ipc_handler(move |req| {
             let msg = match req.body().as_str() {
                 "drag" => Ui::Drag,
@@ -142,6 +167,17 @@ fn set_fullscreen(window: &tao::window::Window, on: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_fullscreen(window: &tao::window::Window, on: bool) {
     window.set_fullscreen(on.then(|| tao::window::Fullscreen::Borderless(window.current_monitor())));
+}
+
+fn is_allowed_navigation(origin: &str, url: &str) -> bool {
+    if url == "about:blank" || url.starts_with("about:srcdoc") || url == origin || url.starts_with(&format!("{origin}/")) {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    ["youtube.com", "youtube-nocookie.com", "google.com", "googlevideo.com", "ytimg.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 /// L'interface ne devine pas l'état plein écran : c'est la fenêtre qui fait foi.

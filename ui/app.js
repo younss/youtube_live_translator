@@ -518,6 +518,11 @@ const viz = $("viz"), vctx = viz.getContext("2d");
 const bars = new Array(19).fill(0), peaks = new Array(19).fill(0);
 function drawViz() {
   const playing = state.player?.getPlayerState?.() === 1;
+  // Rien ne joue (ou fenêtre masquée) et barres retombées : on ralentit à 2 images/s.
+  if ((!playing || document.hidden) && bars.every((b) => b < 0.01) && peaks.every((p) => p < 0.01)) {
+    setTimeout(() => requestAnimationFrame(drawViz), 500);
+    return;
+  }
   const w = viz.width, h = viz.height, bw = w / bars.length;
   vctx.clearRect(0, 0, w, h);
   const now = performance.now() / 1000;

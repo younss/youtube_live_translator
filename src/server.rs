@@ -25,7 +25,9 @@ struct Assets;
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Config {
-    #[serde(default)]
+    /// Ancien emplacement de la clé (en clair) : lu une fois pour migration vers le Trousseau,
+    /// jamais réécrit sur disque.
+    #[serde(default, skip_serializing)]
     anthropic_key: Option<String>,
     #[serde(default = "default_model")]
     whisper_model: String,
@@ -35,6 +37,50 @@ struct Config {
 
 fn default_nmt() -> String {
     crate::nmt::DEFAULT_MODEL.into()
+}
+
+/// config.json ne contient plus de secret, mais on le garde lisible par l'utilisateur seul.
+fn write_config(path: &std::path::Path, cfg: &Config) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(cfg)?)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Clé API Claude dans le Trousseau macOS (chiffré, lié à la session de l'utilisateur).
+mod secrets {
+    const SERVICE: &str = "com.younss.ytlt";
+    const ACCOUNT: &str = "anthropic-api-key";
+
+    #[cfg(target_os = "macos")]
+    pub fn get() -> Option<String> {
+        let bytes = security_framework::passwords::get_generic_password(SERVICE, ACCOUNT).ok()?;
+        String::from_utf8(bytes).ok().filter(|k| !k.is_empty())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set(key: Option<&str>) -> anyhow::Result<()> {
+        match key {
+            Some(k) => security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, k.as_bytes())?,
+            None => {
+                let _ = security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn get() -> Option<String> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set(_: Option<&str>) -> anyhow::Result<()> {
+        anyhow::bail!("stockage sécurisé indisponible sur ce système")
+    }
 }
 
 fn default_model() -> String {
@@ -91,6 +137,13 @@ impl AppState {
         if config.nmt_model.is_empty() {
             config.nmt_model = default_nmt();
         }
+        // Migration : une clé laissée en clair dans config.json part dans le Trousseau.
+        let legacy_key = config.anthropic_key.take().filter(|k| !k.trim().is_empty());
+        let migrated = legacy_key.is_none_or(|key| secrets::set(Some(&key)).is_ok());
+        // Réécrit toujours le fichier : champ de clé retiré et droits 600.
+        if migrated && config_path.is_file() {
+            let _ = write_config(&config_path, &config);
+        }
         Self {
             jobs: Default::default(),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -106,8 +159,7 @@ impl AppState {
     }
 
     fn api_key(&self) -> Option<String> {
-        let from_cfg = self.config.lock().unwrap().anthropic_key.clone().filter(|k| !k.trim().is_empty());
-        from_cfg.or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()))
+        secrets::get().or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()))
     }
 
     fn update_job(&self, id: u64, f: impl FnOnce(&mut Job)) {
@@ -145,7 +197,96 @@ fn models_missing(st: &AppState) -> bool {
     !whisper::model_path(&models, &whisper_model).is_file() || !crate::nmt::is_ready(&models, &nmt_model)
 }
 
-pub fn router() -> Router {
+/// Seule la fenêtre de l'app peut parler au serveur : elle reçoit au lancement un jeton
+/// secret, échangé contre un cookie HttpOnly / SameSite=Strict. Le contrôle de l'en-tête Host
+/// bloque le « DNS rebinding » (un site web qui se ferait passer pour 127.0.0.1).
+#[derive(Clone)]
+struct Guard {
+    token: Arc<String>,
+    hosts: Arc<[String; 2]>,
+}
+
+const COOKIE: &str = "ytlt_session";
+
+fn same_secret(a: &str, b: &str) -> bool {
+    // Comparaison en temps constant.
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn guard(
+    State(g): State<Guard>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = req.headers();
+    let host_ok = headers.get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|h| g.hosts.iter().any(|a| a == h));
+    let origin_ok = headers
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .is_none_or(|o| g.hosts.iter().any(|a| o == format!("http://{a}")));
+    if !host_ok || !origin_ok {
+        return (StatusCode::FORBIDDEN, "accès refusé").into_response();
+    }
+
+    // Première ouverture par l'app : « /?t=<jeton> » -> cookie de session, puis « / ».
+    if let Some(t) = req.uri().query().and_then(|q| q.split('&').find_map(|p| p.strip_prefix("t="))) {
+        if same_secret(t, &g.token) {
+            let cookie = format!("{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict", g.token);
+            return (StatusCode::SEE_OTHER, [(header::SET_COOKIE, cookie), (header::LOCATION, "/".to_string())]).into_response();
+        }
+        return (StatusCode::FORBIDDEN, "jeton invalide").into_response();
+    }
+
+    let authed = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")))
+        .any(|v| same_secret(v, &g.token));
+    if !authed {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<h1>Accès réservé</h1><p>Ouvrez YouTube Live Translator.</p>",
+        )
+            .into_response();
+    }
+
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    for (name, value) in SECURITY_HEADERS {
+        if let Ok(v) = header::HeaderValue::from_str(value) {
+            h.insert(*name, v);
+        }
+    }
+    resp
+}
+
+/// La page ne peut charger que ses propres fichiers, le lecteur/flux YouTube, hls.js et les polices.
+const SECURITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "content-security-policy",
+        "default-src 'self'; \
+         script-src 'self' https://www.youtube.com https://s.ytimg.com https://cdn.jsdelivr.net; \
+         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+         font-src https://fonts.gstatic.com; \
+         img-src 'self' data: https://i.ytimg.com; \
+         media-src 'self' blob: https://*.googlevideo.com; \
+         connect-src 'self' https://*.googlevideo.com; \
+         frame-src https://www.youtube.com https://www.youtube-nocookie.com; \
+         worker-src blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'",
+    ),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "strict-origin-when-cross-origin"),
+    ("cross-origin-opener-policy", "same-origin"),
+];
+
+pub fn router(token: String, port: u16) -> Router {
+    let g = Guard {
+        token: Arc::new(token),
+        hosts: Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}")]),
+    };
     let state = AppState::new();
     // Fichiers temporaires d'une session précédente (audio de repli, sous-titres bruts).
     let _ = std::fs::remove_dir_all(state.cache_dir.join("work"));
@@ -176,6 +317,7 @@ pub fn router() -> Router {
         .route("/api/translate", post(translate_text))
         .fallback(static_file)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(g, guard))
 }
 
 async fn static_file(uri: Uri) -> Response {
@@ -224,7 +366,10 @@ async fn save_settings(State(st): State<AppState>, Json(req): Json<SettingsReq>)
     let cfg = {
         let mut cfg = st.config.lock().unwrap();
         if let Some(k) = req.anthropic_key {
-            cfg.anthropic_key = Some(k.trim().to_string()).filter(|k| !k.is_empty());
+            let k = k.trim();
+            if let Err(e) = secrets::set((!k.is_empty()).then_some(k)) {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Trousseau : {e}"));
+            }
         }
         if let Some(m) = req.nmt_model.filter(|m| crate::nmt::MODELS.iter().any(|(n, _, _)| n == m)) {
             cfg.nmt_model = m;
@@ -234,14 +379,7 @@ async fn save_settings(State(st): State<AppState>, Json(req): Json<SettingsReq>)
         }
         cfg.clone()
     };
-    let write = async {
-        if let Some(dir) = st.config_path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        tokio::fs::write(&st.config_path, serde_json::to_vec_pretty(&cfg)?).await?;
-        anyhow::Ok(())
-    };
-    match write.await {
+    match write_config(&st.config_path, &cfg) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

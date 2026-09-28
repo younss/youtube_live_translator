@@ -50,3 +50,13 @@ Typing anything that isn't a URL in the address bar runs a YouTube search (RECHE
 - Live streams: YouTube subtitles work if the stream provides them. Whisper needs the full video.
 - For songs, Whisper works best with the `large-v3-turbo` model (the default). Setting the source language (e.g. Turkish) instead of "Auto" further improves recognition.
 - The spectrum analyzer is decorative: the page cannot read the YouTube audio signal.
+
+## Security
+
+- The local server listens on `127.0.0.1` only, so it can't be reached from the network.
+- Each launch generates a random 256-bit **session token**, given only to the app window. The window swaps it for an `HttpOnly` / `SameSite=Strict` cookie.
+- Every request without that cookie is rejected (403): other local programs, and websites open in a browser (CSRF).
+- The `Host` / `Origin` headers are checked, which blocks DNS rebinding.
+- The Claude API key is stored in the **macOS Keychain**. `config.json` (mode 600) no longer holds any secret.
+- The window only loads the app and the YouTube player. Any other navigation is refused, and pop-up windows open in the default browser.
+- A strict Content-Security-Policy is in place: only the app's scripts, the YouTube player/streams, hls.js and the fonts are allowed.
