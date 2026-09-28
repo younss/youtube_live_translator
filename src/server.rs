@@ -99,6 +99,7 @@ pub fn router() -> Router {
         .route("/api/jobs", post(create_job))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/search", get(search))
+        .route("/api/mix/{id}", get(mix))
         .route("/api/stream/{id}", get(stream))
         .route("/api/media/{key}/{kind}", get(media))
         .route("/api/export", post(export_srt))
@@ -303,17 +304,17 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
             }
             engine => {
                 let engine = if engine == "claude" { Engine::Claude } else { Engine::Google };
-                translator = if engine == Engine::Claude { "Claude".into() } else { "Google".into() };
+                let label = if engine == Engine::Claude { "Claude" } else { "Google" };
                 let p = progress.clone();
                 let sub: Progress = Arc::new(move |f, s| p(0.6 + 0.39 * f, s));
-                sub(0.0, format!("Traduction via {translator}…"));
+                sub(0.0, format!("Traduction via {label}…"));
                 let src = if source_lang == "auto" { "auto".to_string() } else { base(&source_lang) };
                 let context = translate::TranslationContext {
                     title: meta.title.clone(),
                     voice: req.voice.clone(),
                     addressee: req.addressee.clone(),
                 };
-                translate::translate_cues(&mut cues, &src, target, engine, st.api_key(), context, sub).await?;
+                translator = translate::translate_cues(&mut cues, &src, target, engine, st.api_key(), context, sub).await?;
             }
         }
     }
@@ -551,6 +552,14 @@ async fn search(Query(q): Query<SearchReq>) -> Response {
 async fn client_log(body: String) -> StatusCode {
     eprintln!("[ui] {}", body.chars().take(2000).collect::<String>());
     StatusCode::NO_CONTENT
+}
+
+async fn mix(UrlPath(id): UrlPath<String>) -> Response {
+    let Some(id) = youtube::video_id(&id) else { return err(StatusCode::BAD_REQUEST, "identifiant invalide") };
+    match youtube::mix(&id, 10).await {
+        Ok(hits) => Json(hits).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    }
 }
 
 #[derive(Deserialize)]

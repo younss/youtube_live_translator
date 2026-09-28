@@ -159,20 +159,30 @@ pub async fn download_track(id: &str, track: &Track, dir: &Path) -> Result<Vec<C
     bail!("YouTube n'a renvoyé aucun fichier pour la piste « {} »", track.key)
 }
 
-/// Télécharge la meilleure piste audio (pour Whisper). Renvoie le chemin du fichier.
+/// Télécharge la piste audio (pour Whisper). Renvoie le chemin du fichier.
+/// YouTube renvoie de plus en plus souvent 403 sur les fichiers audio directs alors que
+/// le HLS (celui du lecteur) passe : on essaie donc le HLS d'abord.
 pub async fn download_audio(id: &str, dir: &Path) -> Result<PathBuf> {
-    let mut cmd = ytdlp()?;
-    cmd.args(["-f", "bestaudio/best", "--no-warnings", "--no-playlist", "--no-part"])
-        .arg("-o")
-        .arg(dir.join(format!("{id}.audio.%(ext)s")))
-        .args(["--print", "after_move:filepath"])
-        .arg(watch_url(id));
-    let out = run(cmd).await?;
-    let path = out.lines().last().map(str::trim).unwrap_or_default();
-    if path.is_empty() {
-        bail!("yt-dlp n'a pas indiqué le fichier audio");
+    let mut last_err = anyhow!("aucun format audio");
+    for format in ["ba[protocol=m3u8_native]/b[protocol=m3u8_native]", "bestaudio/best"] {
+        let mut cmd = ytdlp()?;
+        cmd.args(["-f", format, "--no-warnings", "--no-playlist", "--no-part", "--force-overwrites"])
+            .arg("-o")
+            .arg(dir.join(format!("{id}.audio.%(ext)s")))
+            .args(["--print", "after_move:filepath"])
+            .arg(watch_url(id));
+        match run(cmd).await {
+            Ok(out) => {
+                let path = out.lines().last().map(str::trim).unwrap_or_default();
+                if !path.is_empty() && Path::new(path).is_file() {
+                    return Ok(PathBuf::from(path));
+                }
+                last_err = anyhow!("yt-dlp n'a pas indiqué le fichier audio");
+            }
+            Err(e) => last_err = e,
+        }
     }
-    Ok(PathBuf::from(path))
+    Err(last_err)
 }
 
 /// Flux directs lisibles par une balise `<video>` : vidéo H.264 + audio AAC séparés
@@ -238,10 +248,16 @@ pub struct SearchHit {
     pub duration: Option<f64>,
 }
 
-pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+/// Vidéos suivantes du « Mix » YouTube de cette vidéo (la playlist radio `list=RD<id>`).
+pub async fn mix(id: &str, limit: usize) -> Result<Vec<SearchHit>> {
     let mut cmd = ytdlp()?;
-    cmd.args(["--flat-playlist", "-J", "--no-warnings"]).arg(format!("ytsearch{limit}:{query}"));
-    let json: serde_json::Value = serde_json::from_str(&run(cmd).await?)?;
+    cmd.args(["--flat-playlist", "-J", "--no-warnings", "--playlist-end", &(limit + 1).to_string()])
+        .arg(format!("https://www.youtube.com/watch?v={id}&list=RD{id}"));
+    Ok(parse_entries(&run(cmd).await?)?.into_iter().filter(|h| h.id != id).take(limit).collect())
+}
+
+fn parse_entries(json: &str) -> Result<Vec<SearchHit>> {
+    let json: serde_json::Value = serde_json::from_str(json)?;
     let entries = json["entries"].as_array().cloned().unwrap_or_default();
     Ok(entries
         .into_iter()
@@ -254,6 +270,12 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
             })
         })
         .collect())
+}
+
+pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    let mut cmd = ytdlp()?;
+    cmd.args(["--flat-playlist", "-J", "--no-warnings"]).arg(format!("ytsearch{limit}:{query}"));
+    parse_entries(&run(cmd).await?)
 }
 
 #[cfg(test)]

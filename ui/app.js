@@ -697,11 +697,29 @@ function renderPlaylist() {
   });
   $("plCount").textContent = state.playlist.length + " élém.";
 }
-function playOffset(dir, auto = false) {
+async function playOffset(dir, auto = false) {
   const i = state.playlist.findIndex((p) => p.id === state.videoId);
   const next = state.playlist[i + dir];
-  if (next) openVideo(next.id);
-  else if (!auto) toast("Fin de la playlist");
+  if (next) { openVideo(next.id); return; }
+  if (dir < 0) { toast("Début de la playlist"); return; }
+  if (!state.videoId || state.fetchingMix) return;
+  // Fin de la playlist : on enchaîne sur le Mix YouTube de la vidéo en cours.
+  state.fetchingMix = true;
+  toast("Recherche des vidéos suivantes (Mix YouTube)…");
+  try {
+    const hits = await api("/api/mix/" + state.videoId);
+    const fresh = hits.filter((h) => !state.playlist.some((p) => p.id === h.id));
+    if (!fresh.length) { toast("Pas de vidéo suivante trouvée"); return; }
+    fresh.forEach((h) => state.playlist.push({ id: h.id, title: h.title }));
+    savePlaylist();
+    renderPlaylist();
+    openVideo(fresh[0].id);
+  } catch (e) {
+    toast("Vidéo suivante indisponible");
+    status("Mix YouTube : " + e.message);
+  } finally {
+    state.fetchingMix = false;
+  }
 }
 $("plAdd").onclick = () => {
   const id = videoId($("urlInput").value);

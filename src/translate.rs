@@ -41,6 +41,8 @@ pub struct TranslationContext {
 }
 
 /// Traduit `cue.orig` vers `target` et remplit `cue.text`.
+/// Traduit `cue.orig` vers `target` et remplit `cue.text`.
+/// Renvoie le nom du service réellement utilisé (Google peut basculer sur MyMemory).
 pub async fn translate_cues(
     cues: &mut [Cue],
     source: &str,
@@ -49,40 +51,47 @@ pub async fn translate_cues(
     api_key: Option<String>,
     context: TranslationContext,
     progress: Progress,
+) -> Result<String> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        // Google signale un blocage par une redirection vers /sorry : on veut la voir.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    match engine {
+        Engine::Claude => {
+            let key = api_key.ok_or_else(|| anyhow!("Aucune clé API Claude configurée (Réglages ou ANTHROPIC_API_KEY)"))?;
+            translate_claude(cues, source, target, &http, key, context, progress).await?;
+            Ok("Claude".into())
+        }
+        Engine::Google => translate_free(cues, source, target, &http, progress).await,
+    }
+}
+
+async fn translate_claude(
+    cues: &mut [Cue],
+    source: &str,
+    target: &str,
+    http: &reqwest::Client,
+    key: String,
+    context: TranslationContext,
+    progress: Progress,
 ) -> Result<()> {
-    let context = Arc::new(context);
-    let batch_size = match engine {
-        Engine::Google => 25,
-        Engine::Claude => 80,
-    };
+    const BATCH: usize = 80;
     let texts: Vec<String> = cues.iter().map(|c| c.orig.clone()).collect();
     let batches: Vec<(usize, Vec<String>)> =
-        texts.chunks(batch_size).enumerate().map(|(i, b)| (i * batch_size, b.to_vec())).collect();
+        texts.chunks(BATCH).enumerate().map(|(i, b)| (i * BATCH, b.to_vec())).collect();
     let total = batches.len();
-
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
-    let limit = Arc::new(Semaphore::new(match engine {
-        Engine::Google => 3,
-        Engine::Claude => 4,
-    }));
-    let key = api_key.map(Arc::new);
+    let (key, context, limit) = (Arc::new(key), Arc::new(context), Arc::new(Semaphore::new(4)));
     let mut set = JoinSet::new();
     for (offset, batch) in batches {
         let (http, limit, key, context) = (http.clone(), limit.clone(), key.clone(), context.clone());
         let (source, target) = (source.to_string(), target.to_string());
         set.spawn(async move {
             let _permit = limit.acquire_owned().await?;
-            let out = match engine {
-                Engine::Google => google_batch(&http, &batch, &source, &target).await,
-                Engine::Claude => {
-                    let key = key.ok_or_else(|| anyhow!("Aucune clé API Claude configurée (Réglages ou ANTHROPIC_API_KEY)"))?;
-                    claude_batch(&http, &key, &batch, &source, &target, &context).await
-                }
-            }?;
+            let out = claude_batch(&http, &key, &batch, &source, &target, &context).await?;
             anyhow::Ok((offset, out))
         });
     }
-
     let mut done = 0;
     while let Some(res) = set.join_next().await {
         let (offset, out) = res??;
@@ -92,44 +101,121 @@ pub async fn translate_cues(
             }
         }
         done += 1;
-        progress(done as f32 / total as f32, format!("Traduction {done}/{total}"));
+        progress(done as f32 / total as f32, format!("Traduction Claude {done}/{total}"));
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------- Google
+// ---------------------------------------------------------------- Google, puis MyMemory
+
+/// Google est essayé en premier, par lots, un seul à la fois pour ne pas déclencher son
+/// anti-robot. S'il bloque (captcha « unusual traffic »), on continue avec MyMemory.
+async fn translate_free(cues: &mut [Cue], source: &str, target: &str, http: &reqwest::Client, progress: Progress) -> Result<String> {
+    const BATCH: usize = 40;
+    let total = cues.len();
+    let mut google_ok = true;
+    let mut i = 0;
+    while i < total {
+        let end = (i + BATCH).min(total);
+        let lines: Vec<String> = cues[i..end].iter().map(|c| c.orig.clone()).collect();
+        let out = if google_ok {
+            match google_batch(http, &lines, source, target).await {
+                Ok(out) => Some(out),
+                Err(e) if e.is::<GoogleBlocked>() => {
+                    google_ok = false;
+                    progress(i as f32 / total as f32, "Google bloqué — bascule sur MyMemory…".into());
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+        let out = match out {
+            Some(out) => out,
+            None => mymemory_batch(http, &lines, source, target).await?,
+        };
+        for (c, t) in cues[i..end].iter_mut().zip(out) {
+            c.text = t;
+        }
+        i = end;
+        let who = if google_ok { "Google" } else { "MyMemory" };
+        progress(i as f32 / total as f32, format!("Traduction {who} {i}/{total}"));
+    }
+    Ok(if google_ok { "Google".into() } else { "MyMemory (Google bloqué)".into() })
+}
+
+#[derive(Debug)]
+struct GoogleBlocked;
+
+impl std::fmt::Display for GoogleBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Google Translate bloque temporairement cette adresse IP (trop de requêtes) — réessayez plus tard ou utilisez Claude")
+    }
+}
+
+impl std::error::Error for GoogleBlocked {}
 
 async fn google_batch(http: &reqwest::Client, lines: &[String], source: &str, target: &str) -> Result<Vec<String>> {
-    // Une requête par lot : les lignes sont séparées par des retours à la ligne,
-    // que Google conserve. Si le découpage ne correspond pas, on repasse ligne par ligne.
-    let joined = lines.join("\n");
-    let out = google_one(http, &joined, source, target).await?;
+    // Les lignes sont séparées par des retours à la ligne, que Google conserve en général.
+    let out = google_one(http, &lines.join("\n"), source, target).await?;
     let parts: Vec<String> = out.split('\n').map(|s| s.trim().to_string()).collect();
     if parts.len() == lines.len() {
         return Ok(parts);
     }
-    let mut res = Vec::with_capacity(lines.len());
-    for l in lines {
-        res.push(google_one(http, l, source, target).await?.trim().to_string());
+    // Découpage différent (rare) : on renvoie le lot en deux moitiés plutôt que ligne par ligne,
+    // pour limiter le nombre de requêtes.
+    if lines.len() == 1 {
+        return Ok(vec![out.trim().to_string()]);
     }
-    Ok(res)
+    let mid = lines.len() / 2;
+    let mut left = Box::pin(google_batch(http, &lines[..mid], source, target)).await?;
+    left.extend(Box::pin(google_batch(http, &lines[mid..], source, target)).await?);
+    Ok(left)
 }
 
 async fn google_one(http: &reqwest::Client, text: &str, source: &str, target: &str) -> Result<String> {
     let sl = if source.is_empty() { "auto" } else { source };
-    let resp: Value = http
+    let resp = http
         .post("https://translate.googleapis.com/translate_a/single")
         .query(&[("client", "gtx"), ("sl", sl), ("tl", target), ("dt", "t")])
         .form(&[("q", text)])
         .send()
         .await
-        .context("Google Translate injoignable")?
-        .error_for_status()
-        .context("Google Translate a refusé la requête (limite de débit ?)")?
-        .json()
-        .await?;
+        .context("Google Translate injoignable")?;
+    let status = resp.status();
+    if status.is_redirection() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(GoogleBlocked.into());
+    }
+    let resp: Value = resp.error_for_status().context("Google Translate a refusé la requête")?.json().await?;
     let segments = resp[0].as_array().ok_or_else(|| anyhow!("réponse Google inattendue"))?;
     Ok(segments.iter().filter_map(|s| s[0].as_str()).collect())
+}
+
+/// MyMemory (gratuit, sans clé, ~5000 caractères/jour) : une ligne par requête, 500 octets max.
+async fn mymemory_batch(http: &reqwest::Client, lines: &[String], source: &str, target: &str) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if source == "auto" {
+            bail!("MyMemory a besoin de la langue source : choisissez-la dans « DE » au lieu de « Auto »");
+        }
+        let q: String = line.chars().take(450).collect();
+        let v: Value = http
+            .get("https://api.mymemory.translated.net/get")
+            .query(&[("q", q.as_str()), ("langpair", &format!("{source}|{target}"))])
+            .send()
+            .await
+            .context("MyMemory injoignable")?
+            .json()
+            .await
+            .context("réponse MyMemory illisible")?;
+        let code = v["responseStatus"].as_i64().or_else(|| v["responseStatus"].as_str().and_then(|s| s.parse().ok()));
+        if code != Some(200) {
+            bail!("MyMemory : {}", v["responseDetails"].as_str().unwrap_or("quota atteint"));
+        }
+        out.push(v["responseData"]["translatedText"].as_str().unwrap_or(line).to_string());
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- Claude
