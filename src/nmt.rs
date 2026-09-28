@@ -110,18 +110,20 @@ type Engine = (PathBuf, Translator<NllbTokenizer>, Arc<Mutex<&'static str>>);
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static LAST_USE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// Libère le modèle (~0,7–1,4 Go) après 5 min sans traduction ; il se recharge en ~1 s.
+/// Libère le modèle (~0,7–1,4 Go) après 1 min sans traduction ; il se recharge en ~1 s.
 fn start_idle_reaper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            let idle = LAST_USE.lock().ok().and_then(|t| *t).is_some_and(|t| t.elapsed().as_secs() > 300);
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let idle = LAST_USE.lock().ok().and_then(|t| *t).is_some_and(|t| t.elapsed().as_secs() > 60);
             if idle {
                 // try_lock : on ne libère jamais un modèle en train de traduire.
                 if let Ok(mut guard) = ENGINE.try_lock() {
                     if guard.take().is_some() {
                         *LAST_USE.lock().unwrap() = None;
+                        drop(guard);
+                        crate::release_memory();
                     }
                 }
             }

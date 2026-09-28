@@ -296,6 +296,7 @@ pub fn transcribe_stream(
     if let Ok(mut guard) = MODEL.lock() {
         *guard = None;
     }
+    crate::release_memory();
     Ok((cues, detected))
 }
 

@@ -22,6 +22,18 @@ use wry::WebViewBuilder;
 
 const PREFERRED_PORT: u16 = 47653;
 
+/// Rend au système la mémoire libérée (sinon l'allocateur de macOS la garde en réserve
+/// et elle reste comptée dans l'app après le déchargement d'un modèle).
+pub fn release_memory() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}
+
 #[derive(Debug)]
 enum Ui {
     Drag,
