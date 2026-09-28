@@ -57,6 +57,11 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     streams: Arc<Mutex<HashMap<String, (std::time::Instant, youtube::Streams)>>>,
     http: reqwest::Client,
+    /// Un verrou par transcription (vidéo + mode + langue source) : un seul Whisper à la fois
+    /// pour une même vidéo, les autres jobs attendent son résultat.
+    transcribing: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Jobs en cours : (vidéo, clé de transcription, poignée pour l'annuler).
+    running: Arc<Mutex<HashMap<u64, (String, String, tokio::task::AbortHandle)>>>,
     /// Installation des modèles au premier lancement : (en cours, progression, message).
     setup: Arc<Mutex<(bool, f32, String)>>,
     cache_dir: PathBuf,
@@ -84,6 +89,8 @@ impl AppState {
             streams: Default::default(),
             http: reqwest::Client::new(),
             setup: Arc::new(Mutex::new((false, 1.0, String::new()))),
+            transcribing: Default::default(),
+            running: Default::default(),
             cache_dir,
             config_path,
         }
@@ -249,6 +256,20 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
     if youtube::video_id(&req.url).is_none() {
         return err(StatusCode::BAD_REQUEST, "URL YouTube invalide");
     }
+    let video = youtube::video_id(&req.url).unwrap_or_default();
+    let tkey = transcript_key(&video, &req);
+    // Un job pour une autre vidéo (ou une autre source) rend les précédents inutiles :
+    // on les annule, ce qui arrête aussi leur whisper-cli. Même transcription : on la garde,
+    // le nouveau job attendra son résultat au lieu d'en relancer une.
+    for (jid, (v, k, handle)) in st.running.lock().unwrap().iter() {
+        if *v != video || *k != tkey {
+            handle.abort();
+            st.update_job(*jid, |j| {
+                j.state = "error";
+                j.error = Some("annulé (nouvelle demande)".into());
+            });
+        }
+    }
     let id = st.next_id.fetch_add(1, Ordering::Relaxed);
     st.jobs.lock().unwrap().insert(
         id,
@@ -263,7 +284,7 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
         },
     );
     let st2 = st.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let progress: Progress = {
             let st = st2.clone();
             Arc::new(move |p, stage| st.update_job(id, |j| {
@@ -294,7 +315,13 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
                 j.error = Some(format!("{e:#}"));
             }
         });
+        st2.running.lock().unwrap().remove(&id);
     });
+    let mut running = st.running.lock().unwrap();
+    running.retain(|_, (_, _, h)| !h.is_finished());
+    if !task.is_finished() {
+        running.insert(id, (video, tkey, task.abort_handle()));
+    }
     Json(json!({ "id": id })).into_response()
 }
 
@@ -328,12 +355,18 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
 
     // La transcription ne dépend pas de la langue cible : on la garde à part pour que changer
     // de langue (arabe → français…) ne relance ni YouTube ni Whisper, seulement la traduction.
-    let transcript_file = st.cache_dir.join("transcripts").join(format!("{id}_{}_{}.json", req.mode, req.source));
-    let cached: Option<Transcript> = if req.refresh {
-        None
-    } else {
-        tokio::fs::read_to_string(&transcript_file).await.ok().and_then(|s| serde_json::from_str(&s).ok())
+    let tkey = transcript_key(&id, req);
+    let transcript_file = st.cache_dir.join("transcripts").join(format!("{tkey}.json"));
+    let read_cached = || async {
+        tokio::fs::read_to_string(&transcript_file).await.ok().and_then(|s| serde_json::from_str::<Transcript>(&s).ok())
     };
+    let lock = st.transcribing.lock().unwrap().entry(tkey.clone()).or_default().clone();
+    if lock.try_lock().is_err() {
+        progress(0.05, "Transcription déjà en cours pour cette vidéo — en attente…".into());
+    }
+    let _transcribing = lock.lock().await;
+    // Relu après l'attente : un autre job vient peut-être de terminer cette transcription.
+    let cached: Option<Transcript> = if req.refresh { None } else { read_cached().await };
     let mut meta: Option<youtube::Meta> = None;
     let transcript = match cached {
         Some(t) => {
@@ -438,6 +471,10 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
         tokio::fs::write(&cache_file, serde_json::to_vec(&result)?).await?;
     }
     Ok(result)
+}
+
+fn transcript_key(id: &str, req: &JobReq) -> String {
+    format!("{id}_{}_{}", req.mode, req.source)
 }
 
 #[derive(Serialize, Deserialize)]
