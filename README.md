@@ -2,27 +2,44 @@
 
 A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It plays a YouTube video from its URL and shows **generated and translated subtitles**, from and to **Arabic, French, English, German, Turkish and Spanish**.
 
-## Install
+## Build from source (macOS)
+
+Prerequisites:
+- macOS 12 or later. Apple Silicon is recommended: Whisper runs on the GPU through Metal.
+- Xcode command line tools: `xcode-select --install`
+- [Rust](https://rustup.rs) (stable, edition 2024)
+- Homebrew: `brew install cmake yt-dlp ffmpeg`
+  - `cmake` is used only at build time, to compile whisper.cpp and CTranslate2;
+  - `yt-dlp` and `ffmpeg` are needed when the app runs.
 
 ```bash
-brew install yt-dlp ffmpeg
-./scripts/install.sh        # builds the app, copies it into /Applications and downloads the models
+git clone https://github.com/younss/youtube_live_translator.git
+cd youtube_live_translator
+./scripts/install.sh
 ```
 
-- `./scripts/dmg.sh` builds `target/YouTube-Live-Translator.dmg`: open it and drag the app onto Applications.
-- `./scripts/bundle.sh` builds `target/YouTube Live Translator.app` only.
-- Models (Whisper + NMT) are downloaded once into `~/Library/Caches/youtube-live-translator/models`: a reinstall doesn't download them again. From the DMG, the app downloads them on first launch (`ytlt --setup` does the same thing from the command line).
-- The icon is drawn by `scripts/make_icon.swift` (→ `assets/icon.png`).
+`install.sh` does three things:
+- builds the app (the first build takes a few minutes, because of the C++ code for whisper.cpp and CTranslate2);
+- copies it into `/Applications` (or `~/Applications`);
+- downloads the models once, about 1.9 GB total (Whisper large-v3-turbo about 550 MB, NLLB 1.3B about 1.3 GB), into `~/Library/Caches/youtube-live-translator/models`.
 
-`cargo run -- --server` starts only the local server (http://127.0.0.1:47653) so you can test in a regular browser.
+Reinstalling doesn't download the models again.
+
+Other scripts:
+- `./scripts/bundle.sh` builds `target/YouTube Live Translator.app` without installing it.
+- `./scripts/dmg.sh` builds a `.dmg`. Installed from the DMG, the app downloads the models on first launch.
+- `cargo run --release -- --setup` downloads the models only.
+- `cargo run --release -- --server` starts only the local server, to debug from a browser. It prints the URL to open, which includes the session token.
+
+Keep `yt-dlp` up to date (`brew upgrade yt-dlp`): YouTube changes often, and an outdated yt-dlp is the most common cause of errors.
 
 ## How it works
 
 | Step | Tool |
 |---|---|
-| Playback | **Native** player: yt-dlp resolves the H.264 + AAC streams, which play in synced `<video>`/`<audio>` elements. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
+| Playback | **Native** player. yt-dlp resolves the stream: in the app, YouTube's HLS stream, which WebKit plays natively with audio and video together; in a regular browser, separate H.264 + AAC streams relayed by the local server. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
 | Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise **Whisper compiled into the app** (whisper.cpp + Metal). The audio is read as a stream by ffmpeg and transcribed in 30 s chunks as it arrives, with nothing downloaded to disk. |
-| Translation | **Local NMT** by default: NLLB-200 int8, 1.3B (better quality) or 600M (lighter) to choose in ⚙ Settings, running in CTranslate2, compiled into the app. It's offline, needs no key, and uses about 630 MB on disk. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
+| Translation | **Local NMT** by default: NLLB-200 int8, 1.3B (better quality) or 600M (lighter) to choose in ⚙ Settings, running in CTranslate2, compiled into the app. It's offline and needs no key. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
 | Progressive display | With the local NMT, each Whisper segment is translated and shown as soon as it's transcribed. Changing the target language doesn't re-run Whisper: the transcript is cached separately. |
 | Gender and proper names | With Claude: the **VOIX** (who is speaking) and **À QUI** (who is addressed or talked about) choices set the grammatical agreement (Arabic أنتَ/أنتِ, French agreement…). Proper names are kept or transliterated. Google translates line by line and can't take this into account. |
 
@@ -60,3 +77,11 @@ Typing anything that isn't a URL in the address bar runs a YouTube search (RECHE
 - The Claude API key is stored in the **macOS Keychain**. `config.json` (mode 600) no longer holds any secret.
 - The window only loads the app and the YouTube player. Any other navigation is refused, and pop-up windows open in the default browser.
 - A strict Content-Security-Policy is in place: only the app's scripts, the YouTube player/streams, hls.js and the fonts are allowed.
+
+## Third-party licenses
+
+- The code in this repository: no license chosen yet.
+- whisper.cpp and Whisper models: MIT.
+- CTranslate2: MIT.
+- NLLB-200 (translation models): **CC-BY-NC 4.0, non-commercial use only**.
+- yt-dlp: Unlicense. ffmpeg: LGPL/GPL (used as an external program, not bundled).
