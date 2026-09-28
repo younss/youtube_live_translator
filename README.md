@@ -8,9 +8,9 @@ Prerequisites:
 - macOS 12 or later. Apple Silicon is recommended: Whisper runs on the GPU through Metal.
 - Xcode command line tools: `xcode-select --install`
 - [Rust](https://rustup.rs) (stable, edition 2024)
-- Homebrew: `brew install cmake yt-dlp ffmpeg`
+- Homebrew: `brew install cmake yt-dlp`
   - `cmake` is used only at build time, to compile whisper.cpp and CTranslate2;
-  - `yt-dlp` and `ffmpeg` are needed when the app runs.
+  - `yt-dlp` is the only external tool the app needs at runtime.
 
 ```bash
 git clone https://github.com/younss/youtube_live_translator.git
@@ -38,7 +38,7 @@ Keep `yt-dlp` up to date (`brew upgrade yt-dlp`): YouTube changes often, and an 
 | Step | Tool |
 |---|---|
 | Playback | **Native** player. yt-dlp resolves the stream: in the app, YouTube's HLS stream, which WebKit plays natively with audio and video together; in a regular browser, separate H.264 + AAC streams relayed by the local server. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
-| Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise **Whisper compiled into the app** (whisper.cpp + Metal). The audio is read as a stream by ffmpeg and transcribed in 30 s chunks as it arrives, with nothing downloaded to disk. |
+| Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise **Whisper compiled into the app** (whisper.cpp + Metal). The audio is read as a stream and decoded in Rust (HLS/AAC segments via symphonia, resampled to 16 kHz, no ffmpeg), then transcribed in 30 s chunks as it arrives, with nothing downloaded to disk. |
 | Translation | **Local NMT** by default: NLLB-200 int8, 1.3B (better quality) or 600M (lighter) to choose in ⚙ Settings, running in CTranslate2, compiled into the app. It's offline and needs no key. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
 | Progressive display | With the local NMT, each Whisper segment is translated and shown as soon as it's transcribed. Changing the target language doesn't re-run Whisper: the transcript is cached separately. |
 | Gender and proper names | With Claude: the **VOIX** (who is speaking) and **À QUI** (who is addressed or talked about) choices set the grammatical agreement (Arabic أنتَ/أنتِ, French agreement…). Proper names are kept or transliterated. Google translates line by line and can't take this into account. |
@@ -84,7 +84,7 @@ Typing anything that isn't a URL in the address bar runs a YouTube search (RECHE
 - whisper.cpp and Whisper models: MIT.
 - CTranslate2: MIT.
 - NLLB-200 (translation models): **CC-BY-NC 4.0, non-commercial use only**.
-- yt-dlp: Unlicense. ffmpeg: LGPL/GPL (used as an external program, not bundled).
+- yt-dlp: Unlicense. symphonia (audio decoding): MPL-2.0.
 
 ## License and disclaimer
 

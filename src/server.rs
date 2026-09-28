@@ -343,7 +343,6 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
     let models = st.cache_dir.join("models");
     Json(json!({
         "ytdlp": youtube::find_bin("yt-dlp").is_some(),
-        "ffmpeg": youtube::find_bin("ffmpeg").is_some(),
         "whisper": true,
         "claude_key": st.api_key().is_some(),
         "whisper_model": cfg.whisper_model,
@@ -712,10 +711,10 @@ async fn whisper_pipeline(
     let model_progress: Progress = Arc::new(move |f, s| p(0.05 + 0.15 * f, s));
     let model = whisper::ensure_model(&st.cache_dir.join("models"), &size, &model_progress).await?;
 
-    // L'audio est lu en flux par ffmpeg et transcrit morceau par morceau pendant qu'il arrive.
+    // L'audio est lu en flux, décodé en Rust et transcrit morceau par morceau pendant qu'il arrive.
     progress(0.2, "Connexion au flux audio…".into());
     let stream = Arc::new(whisper::PcmStream::default());
-    let feeder = start_audio_feed(id.to_string(), work.to_path_buf(), stream.clone());
+    let feeder = start_audio_feed(id.to_string(), work.to_path_buf(), stream.clone(), st.http.clone());
 
     let p = progress.clone();
     let tr_progress: Progress = Arc::new(move |f, s| p(0.2 + 0.4 * f, s));
@@ -729,55 +728,34 @@ async fn whisper_pipeline(
     Ok((subs::merge_short(cues), lang))
 }
 
-/// Alimente `stream` en PCM 16 kHz : ffmpeg lit directement le flux audio de YouTube.
-/// Si la lecture directe échoue, on retombe sur le téléchargement complet puis le décodage.
-fn start_audio_feed(id: String, work: std::path::PathBuf, stream: Arc<whisper::PcmStream>) -> tokio::task::JoinHandle<()> {
+/// Alimente `stream` en PCM 16 kHz, entièrement en Rust (sans ffmpeg) : les segments HLS audio
+/// de YouTube sont téléchargés et décodés au fil de l'eau. Si le flux direct échoue, on retombe
+/// sur le téléchargement complet de l'audio par yt-dlp, décodé ensuite de la même manière.
+fn start_audio_feed(id: String, work: std::path::PathBuf, stream: Arc<whisper::PcmStream>, http: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let direct = async {
             let url = youtube::audio_stream_url(&id).await?;
-            let ffmpeg = youtube::find_bin("ffmpeg").ok_or_else(|| anyhow!("ffmpeg introuvable — brew install ffmpeg"))?;
-            let mut child = tokio::process::Command::new(ffmpeg)
-                .args(["-nostdin", "-loglevel", "error", "-i", &url, "-ar", "16000", "-ac", "1", "-f", "f32le", "-"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()?;
-            let mut out = child.stdout.take().unwrap();
-            let mut buf = vec![0u8; 1 << 16];
-            let mut carry: Vec<u8> = Vec::new();
-            loop {
-                use tokio::io::AsyncReadExt;
-                let n = out.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                carry.extend_from_slice(&buf[..n]);
-                let whole = carry.len() / 4 * 4;
-                let samples: Vec<f32> =
-                    carry[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-                carry.drain(..whole);
-                stream.push(&samples);
-            }
-            if !child.wait().await?.success() && stream.len() == 0 {
-                bail!("ffmpeg n'a pas pu lire le flux audio");
-            }
-            anyhow::Ok(())
+            crate::audio::stream_hls(&http, &url, |pcm| stream.push(pcm)).await
         };
         match direct.await {
             Ok(()) => stream.finish(None),
             Err(_) if stream.len() == 0 => {
-                // Repli : téléchargement du fichier audio puis décodage complet.
                 let fallback = async {
-                    let audio = youtube::download_audio(&id, &work).await?;
-                    let pcm = whisper::decode_pcm(&audio).await;
-                    let _ = tokio::fs::remove_file(&audio).await;
-                    anyhow::Ok(pcm?)
+                    let path = youtube::download_audio(&id, &work).await?;
+                    let pcm = tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || crate::audio::decode_file(&path)
+                    })
+                    .await?;
+                    let _ = tokio::fs::remove_file(&path).await;
+                    pcm
                 };
                 match fallback.await {
-                    Ok(pcm) => {
+                    Ok(pcm) if !pcm.is_empty() => {
                         stream.push(&pcm);
                         stream.finish(None);
                     }
+                    Ok(_) => stream.finish(Some("audio vide ou format non pris en charge".into())),
                     Err(e) => stream.finish(Some(format!("{e:#}"))),
                 }
             }

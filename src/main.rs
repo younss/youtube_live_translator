@@ -4,6 +4,7 @@
 //! `ytlt`           ouvre la fenêtre
 //! `ytlt --server`  lance uniquement le serveur local (pour tester dans un navigateur)
 
+mod audio;
 mod nmt;
 mod server;
 mod subs;

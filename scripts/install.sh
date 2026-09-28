@@ -17,10 +17,10 @@ echo "Installation des modèles…"
 "$DEST/YouTube Live Translator.app/Contents/MacOS/ytlt" --setup
 
 missing=""
-for tool in yt-dlp ffmpeg; do
+for tool in yt-dlp; do
   command -v $tool >/dev/null 2>&1 || [ -x "/opt/homebrew/bin/$tool" ] || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
   echo "Outils manquants :$missing"
-  echo "Installez-les avec : brew install yt-dlp ffmpeg"
+  echo "Installez-les avec : brew install yt-dlp"
 fi

@@ -87,7 +87,7 @@ async function refreshStatus() {
   try {
     const s = await api("/api/status");
     const dep = (ok, name) => `<span class="${ok ? "ok" : "ko"}">${ok ? "●" : "○"} ${name}</span>`;
-    $("statusDeps").innerHTML = [dep(s.ytdlp, "yt-dlp"), dep(s.ffmpeg, "ffmpeg"), dep(s.whisper, "whisper"),
+    $("statusDeps").innerHTML = [dep(s.ytdlp, "yt-dlp"), dep(s.whisper, "whisper"),
       dep(s.nmt_ready, "NMT local"), dep(s.claude_key, "clé Claude")].join(" &nbsp; ");
     $("whisperModel").value = s.whisper_model;
     $("nmtModel").value = s.nmt_model;

@@ -23,7 +23,7 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
 fn ytdlp() -> Result<Command> {
     let bin = find_bin("yt-dlp").ok_or_else(|| anyhow!("yt-dlp introuvable — installez-le : brew install yt-dlp"))?;
     let mut cmd = Command::new(bin);
-    // yt-dlp a besoin de ffmpeg/deno : on lui donne le même PATH élargi.
+    // yt-dlp peut avoir besoin de deno (déchiffrement des signatures) : PATH élargi à Homebrew.
     let path = format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default());
     cmd.env("PATH", path).kill_on_drop(true);
     Ok(cmd)
@@ -162,7 +162,7 @@ pub async fn download_track(id: &str, track: &Track, dir: &Path) -> Result<Vec<C
 }
 
 /// URL du flux audio seul (HLS en priorité : c'est celui que YouTube sert sans 403),
-/// que ffmpeg peut lire directement pendant que Whisper travaille.
+/// dont les segments sont décodés au fil de l'eau pendant que Whisper travaille.
 pub async fn audio_stream_url(id: &str) -> Result<String> {
     let mut cmd = ytdlp()?;
     cmd.args(["-g", "--no-warnings", "--no-playlist", "-f", "ba[protocol=m3u8_native]/ba/b"]).arg(watch_url(id));
@@ -175,7 +175,8 @@ pub async fn audio_stream_url(id: &str) -> Result<String> {
 /// le HLS (celui du lecteur) passe : on essaie donc le HLS d'abord.
 pub async fn download_audio(id: &str, dir: &Path) -> Result<PathBuf> {
     let mut last_err = anyhow!("aucun format audio");
-    for format in ["ba[protocol=m3u8_native]/b[protocol=m3u8_native]", "bestaudio/best"] {
+    // Formats décodables sans ffmpeg : HLS (AAC/ADTS) ou M4A (AAC dans MP4).
+    for format in ["ba[protocol=m3u8_native]", "ba[ext=m4a]/ba[acodec^=mp4a]"] {
         let mut cmd = ytdlp()?;
         cmd.args(["-f", format, "--no-warnings", "--no-playlist", "--no-part", "--force-overwrites"])
             .arg("-o")

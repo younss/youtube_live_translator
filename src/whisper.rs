@@ -6,12 +6,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::subs::Cue;
 use crate::translate::Progress;
-use crate::youtube::find_bin;
 
 pub fn model_path(models_dir: &Path, size: &str) -> PathBuf {
     models_dir.join(format!("ggml-{size}.bin"))
@@ -40,23 +38,6 @@ pub async fn ensure_model(models_dir: &Path, size: &str, progress: &Progress) ->
     file.flush().await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(path)
-}
-
-/// Décode l'audio en PCM 16 kHz mono f32, le format que whisper.cpp attend.
-/// (ffmpeg ne sert qu'à cette conversion : quelques secondes, quelques Mo de mémoire.)
-pub async fn decode_pcm(input: &Path) -> Result<Vec<f32>> {
-    let ffmpeg = find_bin("ffmpeg").ok_or_else(|| anyhow!("ffmpeg introuvable — brew install ffmpeg"))?;
-    let out = Command::new(ffmpeg)
-        .args(["-nostdin", "-loglevel", "error", "-i"])
-        .arg(input)
-        .args(["-ar", "16000", "-ac", "1", "-f", "f32le", "-"])
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if !out.status.success() {
-        bail!("ffmpeg n'a pas pu décoder l'audio : {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
 }
 
 /// Rappels pour afficher la transcription au fil de l'eau (avant la fin de Whisper).
@@ -158,7 +139,7 @@ fn to_cue(t0: i64, t1: i64, text: &str) -> Option<Cue> {
     Some(Cue { start: t0 as f64 / 100.0, end: t1 as f64 / 100.0, orig: text.clone(), text })
 }
 
-/// Tampon audio alimenté au fil de l'eau (ffmpeg lit le flux YouTube) et consommé par
+/// Tampon audio alimenté au fil de l'eau (flux HLS de YouTube décodé en Rust) et consommé par
 /// Whisper morceau par morceau : pas besoin d'attendre tout l'audio pour commencer.
 #[derive(Default)]
 pub struct PcmStream {
