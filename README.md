@@ -80,8 +80,22 @@ Typing anything that isn't a URL in the address bar runs a YouTube search (RECHE
 
 ## Third-party licenses
 
-- The code in this repository: no license chosen yet.
+- The code in this repository: [MIT](LICENSE).
 - whisper.cpp and Whisper models: MIT.
 - CTranslate2: MIT.
 - NLLB-200 (translation models): **CC-BY-NC 4.0, non-commercial use only**.
 - yt-dlp: Unlicense. ffmpeg: LGPL/GPL (used as an external program, not bundled).
+
+## License and disclaimer
+
+The code is distributed under the [MIT](LICENSE) license: free to use, modify and redistribute.
+
+**The software is provided "as is", without warranty of any kind. The author cannot be held liable for any damage, claim or consequence resulting from its use.**
+
+- This project is a personal, educational project. It is **not affiliated with, endorsed or sponsored by YouTube, Google, Meta, OpenAI, Anthropic** or any other company mentioned.
+- **Each user is solely responsible for their use**, in particular:
+  - compliance with the [YouTube Terms of Service](https://www.youtube.com/t/terms);
+  - respect for the copyright of the content watched, transcribed or translated;
+  - the laws of their country.
+- The generated subtitles and translations are automatic and may be wrong. They must not be relied on for any important decision (legal, medical, etc.).
+- The models used keep their own licenses (see above). NLLB-200 is restricted to non-commercial use.
