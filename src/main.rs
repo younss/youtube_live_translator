@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         .build(&event_loop)?;
 
     let proxy = event_loop.create_proxy();
-    let _webview = WebViewBuilder::new()
+    let webview = WebViewBuilder::new()
         .with_url(&url)
         .with_autoplay(true)
         .with_devtools(cfg!(debug_assertions))
@@ -88,6 +88,7 @@ fn main() -> Result<()> {
         })
         .build(&window)?;
 
+    let mut fullscreen = false;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -101,8 +102,9 @@ fn main() -> Result<()> {
                 Ui::Minimize => window.set_minimized(true),
                 Ui::ToggleMaximize => window.set_maximized(!window.is_maximized()),
                 Ui::ToggleFullscreen => {
-                    let fs = window.fullscreen().is_some();
-                    window.set_fullscreen((!fs).then_some(tao::window::Fullscreen::Borderless(None)));
+                    fullscreen = !fullscreen;
+                    set_fullscreen(&window, fullscreen);
+                    sync_fullscreen(&webview, fullscreen);
                 }
                 Ui::Close => *control_flow = ControlFlow::Exit,
             },
@@ -110,6 +112,24 @@ fn main() -> Result<()> {
             _ => {}
         }
     });
+}
+
+/// Sur macOS, le plein écran « Spaces » (animation vers un nouveau bureau) ne fonctionne pas
+/// avec une fenêtre sans bordure et fige la vidéo ; le plein écran « simple » couvre l'écran sur place.
+#[cfg(target_os = "macos")]
+fn set_fullscreen(window: &tao::window::Window, on: bool) {
+    use tao::platform::macos::WindowExtMacOS;
+    window.set_simple_fullscreen(on);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_fullscreen(window: &tao::window::Window, on: bool) {
+    window.set_fullscreen(on.then(|| tao::window::Fullscreen::Borderless(window.current_monitor())));
+}
+
+/// L'interface ne devine pas l'état plein écran : c'est la fenêtre qui fait foi.
+fn sync_fullscreen(webview: &wry::WebView, on: bool) {
+    let _ = webview.evaluate_script(&format!("window.__setTheater && window.__setTheater({on})"));
 }
 
 /// Sans menu « Édition », macOS ne route pas ⌘C / ⌘V / ⌘A vers la webview.

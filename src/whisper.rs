@@ -57,9 +57,18 @@ pub async fn to_wav(input: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progress) -> Result<Vec<Cue>> {
+/// Transcrit `wav` depuis `offset` secondes (sur `duration` secondes si précisé).
+async fn run_whisper(
+    model: &Path,
+    wav: &Path,
+    lang: &str,
+    offset: f64,
+    duration: Option<f64>,
+    tag: &str,
+    progress: Option<&Progress>,
+) -> Result<Vec<Cue>> {
     let bin = find_bin("whisper-cli").ok_or_else(|| anyhow!("whisper-cli introuvable — brew install whisper-cpp"))?;
-    let prefix = wav.with_extension("");
+    let prefix = PathBuf::from(format!("{}{tag}", wav.with_extension("").display()));
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
     let mut child = Command::new(bin)
         .arg("-m")
@@ -67,7 +76,9 @@ pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progres
         .arg("-f")
         .arg(wav)
         // -mc 0 évite les boucles de répétition sur la musique, -sns retire les « ♪ ».
-        .args(["-l", lang, "-oj", "-pp", "-mc", "0", "-sns", "-t", &threads.to_string(), "-of"])
+        .args(["-l", lang, "-oj", "-pp", "-mc", "0", "-sns", "-t", &threads.to_string()])
+        .args(["-ot", &((offset * 1000.0) as u64).to_string()])
+        .args(["-d", &duration.map_or(0, |d| (d * 1000.0) as u64).to_string(), "-of"])
         .arg(&prefix)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -79,7 +90,9 @@ pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progres
     while let Some(line) = lines.next_line().await? {
         // Format : "whisper_print_progress_callback: progress =  45%"
         if let Some(pct) = line.split("progress =").nth(1).and_then(|p| p.trim().trim_end_matches('%').parse::<f32>().ok()) {
-            progress(pct / 100.0, format!("Transcription Whisper {pct:.0}%"));
+            if let Some(progress) = progress {
+                progress(pct / 100.0, format!("Transcription Whisper {pct:.0}%"));
+            }
         } else {
             tail.push(line);
             if tail.len() > 5 {
@@ -117,6 +130,33 @@ pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progres
             Cue { start: s.offsets.from / 1000.0, end: s.offsets.to / 1000.0, orig: text.clone(), text }
         })
         .collect())
+}
+
+/// Whisper découpe l'audio en fenêtres de 30 s. Quand la première est surtout instrumentale
+/// (intro de chanson), il y invente du texte et perd les premières paroles. Si le début
+/// manque, on relance de courtes passes sur l'intro avec un point de départ décalé.
+pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progress) -> Result<Vec<Cue>> {
+    let mut cues = run_whisper(model, wav, lang, 0.0, None, "", Some(progress)).await?;
+    let first = cues.first().map_or(0.0, |c| c.start);
+    if first > 6.0 {
+        progress(0.99, "Recherche des premières paroles…".into());
+        let mut offset = 2.0;
+        while offset < first - 1.0 {
+            let probe = run_whisper(model, wav, lang, offset, Some(first - offset + 2.0), ".intro", None).await?;
+            let intro: Vec<Cue> = probe.into_iter().filter(|c| c.start < first - 0.3).collect();
+            if !intro.is_empty() {
+                let mut all = intro;
+                if let Some(last) = all.last_mut() {
+                    last.end = last.end.min(first);
+                }
+                all.append(&mut cues);
+                cues = all;
+                break;
+            }
+            offset += 3.0;
+        }
+    }
+    Ok(cues)
 }
 
 /// Sur la musique ou le silence, Whisper « invente » des crédits de sous-titrage

@@ -193,7 +193,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .settings-actions .gen { padding: 0 16px; }
 
 /* ---------- Mode cinéma / plein écran ---------- */
-#app.theater { grid-template-rows: 0 0 1fr 0; }
+#app.theater { grid-template-rows: 1fr; }
 #app.theater .titlebar, #app.theater .navbar, #app.theater .statusbar, #app.theater .side { display: none; }
 #app.theater .body { grid-template-columns: 1fr; }
 #app.theater .controls { position: absolute; left: 0; right: 0; bottom: 0; z-index: 7; opacity: 0; transition: opacity .3s; }

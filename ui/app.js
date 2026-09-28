@@ -562,15 +562,15 @@ for (const id of ["engine", "quality"]) $(id).addEventListener("change", () => {
 });
 $("rate").onchange = (e) => P()?.setPlaybackRate?.(parseFloat(e.target.value));
 
+// Le plein écran est piloté par la fenêtre Rust, qui renvoie l'état réel via __setTheater.
+window.__setTheater = (on) => { $("app").classList.toggle("theater", !!on); };
 function toggleFullscreen() {
-  const app = $("app");
-  const on = !app.classList.contains("theater");
-  app.classList.toggle("theater", on);
-  if (!sendIpc("fs")) {
-    if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
-    else if (!on && document.fullscreenElement) document.exitFullscreen();
-  }
+  if (sendIpc("fs")) return;
+  // Navigateur classique : API Fullscreen du document.
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
+  else document.exitFullscreen();
 }
+document.addEventListener("fullscreenchange", () => window.__setTheater(!!document.fullscreenElement));
 $("btnFs").onclick = toggleFullscreen;
 $("stage").addEventListener("dblclick", toggleFullscreen);
 let controlsTimer;
