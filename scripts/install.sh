@@ -11,6 +11,11 @@ rm -rf "$DEST/YouTube Live Translator.app"
 cp -R "$APP" "$DEST/"
 echo "Installée dans $DEST/YouTube Live Translator.app"
 
+# Modèles (Whisper + traduction NMT) téléchargés maintenant, une seule fois, dans le cache
+# partagé : l'app est prête dès le premier lancement et une réinstallation ne les retélécharge pas.
+echo "Installation des modèles…"
+"$DEST/YouTube Live Translator.app/Contents/MacOS/ytlt" --setup
+
 missing=""
 for tool in yt-dlp ffmpeg whisper-cli; do
   command -v $tool >/dev/null 2>&1 || [ -x "/opt/homebrew/bin/$tool" ] || missing="$missing $tool"

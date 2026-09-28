@@ -42,7 +42,13 @@ struct Job {
     progress: f32,
     result: Option<Value>,
     error: Option<String>,
+    /// Sous-titres déjà prêts pendant que le travail continue (affichage progressif).
+    partial: Option<Vec<Cue>>,
+    partial_rev: u64,
 }
+
+/// Publie les sous-titres déjà prêts dans le job en cours.
+type Publish = Arc<dyn Fn(Vec<Cue>) + Send + Sync>;
 
 #[derive(Clone)]
 struct AppState {
@@ -51,6 +57,8 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     streams: Arc<Mutex<HashMap<String, (std::time::Instant, youtube::Streams)>>>,
     http: reqwest::Client,
+    /// Installation des modèles au premier lancement : (en cours, progression, message).
+    setup: Arc<Mutex<(bool, f32, String)>>,
     cache_dir: PathBuf,
     config_path: PathBuf,
 }
@@ -75,6 +83,7 @@ impl AppState {
             config: Arc::new(Mutex::new(config)),
             streams: Default::default(),
             http: reqwest::Client::new(),
+            setup: Arc::new(Mutex::new((false, 1.0, String::new()))),
             cache_dir,
             config_path,
         }
@@ -92,7 +101,47 @@ impl AppState {
     }
 }
 
+/// Télécharge ce qui manque (modèle Whisper + modèle de traduction NMT) dans le cache
+/// partagé. Appelé par l'installateur (`ytlt --setup`) et au lancement de l'app.
+pub async fn setup_models(progress: Progress) -> Result<()> {
+    let st = AppState::new();
+    run_setup(&st, progress).await
+}
+
+async fn run_setup(st: &AppState, progress: Progress) -> Result<()> {
+    let models = st.cache_dir.join("models");
+    let whisper_model = st.config.lock().unwrap().whisper_model.clone();
+    let p = progress.clone();
+    let wp: Progress = Arc::new(move |f, s| p(0.5 * f, s));
+    whisper::ensure_model(&models, &whisper_model, &wp).await?;
+    let p = progress.clone();
+    let np: Progress = Arc::new(move |f, s| p(0.5 + 0.5 * f, s));
+    crate::nmt::ensure_model(&models, &np).await?;
+    progress(1.0, "Modèles prêts".into());
+    Ok(())
+}
+
+fn models_missing(st: &AppState) -> bool {
+    let models = st.cache_dir.join("models");
+    let whisper_model = st.config.lock().unwrap().whisper_model.clone();
+    !whisper::model_path(&models, &whisper_model).is_file() || !crate::nmt::is_ready(&models)
+}
+
 pub fn router() -> Router {
+    let state = AppState::new();
+    if models_missing(&state) {
+        let st = state.clone();
+        *st.setup.lock().unwrap() = (true, 0.0, "Installation des modèles…".into());
+        tokio::spawn(async move {
+            let s2 = st.clone();
+            let progress: Progress = Arc::new(move |f, msg| *s2.setup.lock().unwrap() = (true, f, msg));
+            let result = run_setup(&st, progress).await;
+            *st.setup.lock().unwrap() = match result {
+                Ok(()) => (false, 1.0, "Modèles prêts".into()),
+                Err(e) => (false, 0.0, format!("Échec de l'installation des modèles : {e:#}")),
+            };
+        });
+    }
     Router::new()
         .route("/api/status", get(status))
         .route("/api/settings", post(save_settings))
@@ -105,7 +154,7 @@ pub fn router() -> Router {
         .route("/api/export", post(export_srt))
         .route("/api/log", post(client_log))
         .fallback(static_file)
-        .with_state(AppState::new())
+        .with_state(state)
 }
 
 async fn static_file(uri: Uri) -> Response {
@@ -127,6 +176,7 @@ fn err(status: StatusCode, e: impl std::fmt::Display) -> Response {
 
 async fn status(State(st): State<AppState>) -> Json<Value> {
     let cfg = st.config.lock().unwrap().clone();
+    let setup = st.setup.lock().unwrap().clone();
     let models = st.cache_dir.join("models");
     Json(json!({
         "ytdlp": youtube::find_bin("yt-dlp").is_some(),
@@ -135,6 +185,8 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
         "claude_key": st.api_key().is_some(),
         "whisper_model": cfg.whisper_model,
         "whisper_model_ready": whisper::model_path(&models, &cfg.whisper_model).is_file(),
+        "nmt_ready": crate::nmt::is_ready(&models),
+        "setup": { "running": setup.0, "progress": setup.1, "message": setup.2 },
         "langs": translate::LANGS.iter().map(|(c, n)| json!({"code": c, "name": n})).collect::<Vec<_>>(),
     }))
 }
@@ -200,7 +252,15 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
     let id = st.next_id.fetch_add(1, Ordering::Relaxed);
     st.jobs.lock().unwrap().insert(
         id,
-        Job { state: "running", stage: "Démarrage…".into(), progress: 0.0, result: None, error: None },
+        Job {
+            state: "running",
+            stage: "Démarrage…".into(),
+            progress: 0.0,
+            result: None,
+            error: None,
+            partial: None,
+            partial_rev: 0,
+        },
     );
     let st2 = st.clone();
     tokio::spawn(async move {
@@ -211,13 +271,23 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
                 j.stage = stage;
             }))
         };
-        let outcome = run_pipeline(&st2, &req, progress).await;
+        let publish: Publish = {
+            let st = st2.clone();
+            Arc::new(move |cues| st.update_job(id, |j| {
+                if j.state == "running" {
+                    j.partial = Some(cues);
+                    j.partial_rev += 1;
+                }
+            }))
+        };
+        let outcome = run_pipeline(&st2, &req, progress, publish).await;
         st2.update_job(id, |j| match outcome {
             Ok(v) => {
                 j.state = "done";
                 j.progress = 1.0;
                 j.stage = "Prêt".into();
                 j.result = Some(v);
+                j.partial = None;
             }
             Err(e) => {
                 j.state = "error";
@@ -235,7 +305,7 @@ async fn get_job(State(st): State<AppState>, UrlPath(id): UrlPath<u64>) -> Respo
     }
 }
 
-async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result<Value> {
+async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: Publish) -> Result<Value> {
     let id = youtube::video_id(&req.url).ok_or_else(|| anyhow!("URL YouTube invalide"))?;
     let target = req.target.as_str();
     if !translate::LANGS.iter().any(|(c, _)| *c == target) {
@@ -256,34 +326,39 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
     }
     tokio::fs::create_dir_all(&work).await?;
 
-    progress(0.02, "Lecture des infos YouTube…".into());
-    let meta = youtube::metadata(&id).await?;
-
-    let mut origin = String::new();
-    let mut source_lang = req.source.clone();
-    let mut cues: Vec<Cue> = Vec::new();
-
-    if req.mode != "whisper" {
-        if let Some(track) = youtube::pick_source_track(&meta, &req.source) {
-            progress(0.1, format!("Téléchargement des sous-titres YouTube ({})…", track.key));
-            cues = subs::merge_short(youtube::download_track(&id, &track, &work).await?);
-            source_lang = track.lang.clone();
-            origin = format!("YouTube {} ({})", if track.auto { "auto" } else { "manuel" }, track.key);
-        } else if req.mode == "youtube" {
-            bail!("Aucun sous-titre YouTube disponible pour cette vidéo — essayez le mode Whisper");
+    // La transcription ne dépend pas de la langue cible : on la garde à part pour que changer
+    // de langue (arabe → français…) ne relance ni YouTube ni Whisper, seulement la traduction.
+    let transcript_file = st.cache_dir.join("transcripts").join(format!("{id}_{}_{}.json", req.mode, req.source));
+    let cached: Option<Transcript> = if req.refresh {
+        None
+    } else {
+        tokio::fs::read_to_string(&transcript_file).await.ok().and_then(|s| serde_json::from_str(&s).ok())
+    };
+    let mut meta: Option<youtube::Meta> = None;
+    let transcript = match cached {
+        Some(t) => {
+            progress(0.55, "Transcription déjà faite — traduction seule…".into());
+            t
         }
-    }
-
-    if cues.is_empty() {
-        if meta.is_live.unwrap_or(false) {
-            bail!("Direct en cours sans sous-titres YouTube : Whisper a besoin de la vidéo complète (réessayez à la fin du live)");
+        None => {
+            // Avec le NMT local, chaque segment Whisper est traduit et affiché dès qu'il sort.
+            let models = st.cache_dir.join("models");
+            let live = (req.translator == "local" && crate::nmt::is_ready(&models))
+                .then(|| start_live_nmt(crate::nmt::model_dir(&models), &req.source, target, publish.clone()));
+            let result = transcribe_video(st, &id, req, &work, &progress, live.as_ref().map(|(l, _)| l)).await;
+            if let Some((_, task)) = live {
+                task.abort();
+            }
+            let (t, m) = result?;
+            if let Some(dir) = transcript_file.parent() {
+                tokio::fs::create_dir_all(dir).await?;
+                tokio::fs::write(&transcript_file, serde_json::to_vec(&t)?).await?;
+            }
+            meta = Some(m);
+            t
         }
-        cues = whisper_pipeline(st, &id, &req.source, &work, &progress).await?;
-        origin = "Whisper (local)".into();
-    }
-    if cues.is_empty() {
-        bail!("Aucune parole détectée");
-    }
+    };
+    let Transcript { title, is_live, source_lang, origin, mut cues } = transcript;
 
     let base = |s: &str| s.split('-').next().unwrap_or(s).to_string();
     let needs_translation = base(&source_lang) != target;
@@ -292,6 +367,10 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
         match req.translator.as_str() {
             "youtube" => {
                 progress(0.6, "Traduction automatique YouTube…".into());
+                let meta = match meta.take() {
+                    Some(m) => m,
+                    None => youtube::metadata(&id).await?,
+                };
                 let track = youtube::Track { key: target.to_string(), lang: target.to_string(), auto: true };
                 let manual = meta.subtitles.contains_key(target);
                 if !manual && !meta.automatic_captions.contains_key(target) {
@@ -302,6 +381,31 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
                 cues = align(translated, &cues);
                 translator = "YouTube".into();
             }
+            "local" => {
+                let p = progress.clone();
+                let dl: Progress = Arc::new(move |f, s| p(0.6 + 0.1 * f, s));
+                let dir = crate::nmt::ensure_model(&st.cache_dir.join("models"), &dl).await?;
+                let p = progress.clone();
+                let sub: Progress = Arc::new(move |f, s| p(0.7 + 0.29 * f, s));
+                let lines: Vec<String> = cues.iter().map(|c| c.orig.clone()).collect();
+                let (src, tgt) = (base(&source_lang), target.to_string());
+                let snapshot = cues.clone();
+                let publish = publish.clone();
+                let out = tokio::task::spawn_blocking(move || {
+                    // Chaque lot traduit est publié tout de suite : l'affichage commence en ~1 s.
+                    let on_chunk = |done: &[String]| {
+                        let ready: Vec<Cue> =
+                            snapshot.iter().zip(done).map(|(c, t)| Cue { text: t.clone(), ..c.clone() }).collect();
+                        publish(ready);
+                    };
+                    crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &sub, &on_chunk)
+                })
+                .await??;
+                for (c, t) in cues.iter_mut().zip(out) {
+                    c.text = t;
+                }
+                translator = "NMT local (NLLB-200)".into();
+            }
             engine => {
                 let engine = if engine == "claude" { Engine::Claude } else { Engine::Google };
                 let label = if engine == Engine::Claude { "Claude" } else { "Google" };
@@ -310,7 +414,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
                 sub(0.0, format!("Traduction via {label}…"));
                 let src = if source_lang == "auto" { "auto".to_string() } else { base(&source_lang) };
                 let context = translate::TranslationContext {
-                    title: meta.title.clone(),
+                    title: title.clone(),
                     voice: req.voice.clone(),
                     addressee: req.addressee.clone(),
                 };
@@ -321,8 +425,8 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
 
     let result = json!({
         "video_id": id,
-        "title": meta.title,
-        "is_live": meta.is_live.unwrap_or(false),
+        "title": title,
+        "is_live": is_live,
         "source_lang": source_lang,
         "target_lang": target,
         "origin": origin,
@@ -336,7 +440,75 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
     Ok(result)
 }
 
-async fn whisper_pipeline(st: &AppState, id: &str, source: &str, work: &std::path::Path, progress: &Progress) -> Result<Vec<Cue>> {
+#[derive(Serialize, Deserialize)]
+struct Transcript {
+    title: String,
+    is_live: bool,
+    source_lang: String,
+    origin: String,
+    cues: Vec<Cue>,
+}
+
+/// Obtient le texte original : sous-titres YouTube si possible, sinon Whisper.
+async fn transcribe_video(
+    st: &AppState,
+    id: &str,
+    req: &JobReq,
+    work: &std::path::Path,
+    progress: &Progress,
+    live: Option<&whisper::Live>,
+) -> Result<(Transcript, youtube::Meta)> {
+    progress(0.02, "Lecture des infos YouTube…".into());
+    let meta = youtube::metadata(id).await?;
+    let mut origin = String::new();
+    let mut source_lang = req.source.clone();
+    let mut cues: Vec<Cue> = Vec::new();
+
+    if req.mode != "whisper" {
+        if let Some(track) = youtube::pick_source_track(&meta, &req.source) {
+            progress(0.1, format!("Téléchargement des sous-titres YouTube ({})…", track.key));
+            cues = subs::merge_short(youtube::download_track(id, &track, work).await?);
+            source_lang = track.lang.clone();
+            origin = format!("YouTube {} ({})", if track.auto { "auto" } else { "manuel" }, track.key);
+        } else if req.mode == "youtube" {
+            bail!("Aucun sous-titre YouTube disponible pour cette vidéo — essayez le mode Whisper");
+        }
+    }
+
+    if cues.is_empty() {
+        if meta.is_live.unwrap_or(false) {
+            bail!("Direct en cours sans sous-titres YouTube : Whisper a besoin de la vidéo complète (réessayez à la fin du live)");
+        }
+        let (whisper_cues, detected) = whisper_pipeline(st, id, &req.source, work, progress, live).await?;
+        cues = whisper_cues;
+        if source_lang == "auto" {
+            if let Some(lang) = detected {
+                source_lang = lang;
+            }
+        }
+        origin = "Whisper (local)".into();
+    }
+    if cues.is_empty() {
+        bail!("Aucune parole détectée");
+    }
+    let transcript = Transcript {
+        title: meta.title.clone(),
+        is_live: meta.is_live.unwrap_or(false),
+        source_lang,
+        origin,
+        cues,
+    };
+    Ok((transcript, meta))
+}
+
+async fn whisper_pipeline(
+    st: &AppState,
+    id: &str,
+    source: &str,
+    work: &std::path::Path,
+    progress: &Progress,
+    live: Option<&whisper::Live>,
+) -> Result<(Vec<Cue>, Option<String>)> {
     let size = st.config.lock().unwrap().whisper_model.clone();
     let p = progress.clone();
     let model_progress: Progress = Arc::new(move |f, s| p(0.05 + 0.15 * f, s));
@@ -350,9 +522,57 @@ async fn whisper_pipeline(st: &AppState, id: &str, source: &str, work: &std::pat
 
     let p = progress.clone();
     let tr_progress: Progress = Arc::new(move |f, s| p(0.25 + 0.35 * f, s));
-    let cues = whisper::transcribe(&model, &wav, source, &tr_progress).await;
+    let cues = whisper::transcribe(&model, &wav, source, &tr_progress, live).await;
     let _ = tokio::fs::remove_file(&wav).await;
-    Ok(subs::merge_short(cues?))
+    let (cues, lang) = cues?;
+    Ok((subs::merge_short(cues), lang))
+}
+
+/// Traducteur « au fil de l'eau » : reçoit les segments de Whisper, les traduit par petits
+/// lots avec le NMT local et publie la liste à jour. La langue source est fixée par
+/// l'utilisateur ou annoncée par Whisper (« auto-detected language »).
+fn start_live_nmt(dir: std::path::PathBuf, source: &str, target: &str, publish: Publish) -> (whisper::Live, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cue>();
+    let lang = Arc::new(Mutex::new((source != "auto").then(|| source.to_string())));
+    let target = target.to_string();
+    let lang_task = lang.clone();
+    let task = tokio::spawn(async move {
+        let mut pending: Vec<Cue> = Vec::new();
+        let mut shown: Vec<Cue> = Vec::new();
+        while let Some(first) = rx.recv().await {
+            pending.push(first);
+            while let Ok(c) = rx.try_recv() {
+                pending.push(c);
+            }
+            let Some(src) = lang_task.lock().unwrap().clone() else { continue };
+            let batch = std::mem::take(&mut pending);
+            let texts: Vec<String> = if src == target {
+                batch.iter().map(|c| c.orig.clone()).collect()
+            } else {
+                let (dir, lines, tgt) = (dir.clone(), batch.iter().map(|c| c.orig.clone()).collect::<Vec<_>>(), target.clone());
+                let quiet: Progress = Arc::new(|_, _| {});
+                match tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await {
+                    Ok(Ok(t)) => t,
+                    _ => continue,
+                }
+            };
+            shown.extend(batch.into_iter().zip(texts).map(|(c, t)| Cue { text: t, ..c }));
+            shown.sort_by(|a, b| a.start.total_cmp(&b.start));
+            publish(shown.clone());
+        }
+    });
+    let live = whisper::Live {
+        on_segment: Arc::new(move |c| {
+            let _ = tx.send(c);
+        }),
+        on_language: Arc::new(move |l| {
+            let mut guard = lang.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(l);
+            }
+        }),
+    };
+    (live, task)
 }
 
 /// Associe à chaque cue traduite le texte original qui la recouvre dans le temps.

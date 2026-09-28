@@ -6,11 +6,12 @@ A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It pl
 
 ```bash
 brew install yt-dlp ffmpeg whisper-cpp
-./scripts/install.sh        # builds the app and copies it into /Applications
+./scripts/install.sh        # builds the app, copies it into /Applications and downloads the models
 ```
 
 - `./scripts/dmg.sh` builds `target/YouTube-Live-Translator.dmg`: open it and drag the app onto Applications.
 - `./scripts/bundle.sh` builds `target/YouTube Live Translator.app` only.
+- Models (Whisper + NMT) are downloaded once into `~/Library/Caches/youtube-live-translator/models`: a reinstall doesn't download them again. From the DMG, the app downloads them on first launch (`ytlt --setup` does the same thing from the command line).
 - The icon is drawn by `scripts/make_icon.swift` (→ `assets/icon.png`).
 
 `cargo run -- --server` starts only the local server (http://127.0.0.1:47653) so you can test in a regular browser.
@@ -21,7 +22,8 @@ brew install yt-dlp ffmpeg whisper-cpp
 |---|---|
 | Playback | **Native** player: yt-dlp resolves the H.264 + AAC streams, which play in synced `<video>`/`<audio>` elements. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
 | Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise a **local Whisper** transcription (whisper.cpp; the model downloads automatically on first use) |
-| Translation | **Google** (free, no key), **Claude** (Anthropic API key in ⚙ Settings or `ANTHROPIC_API_KEY`), or **YouTube's automatic translation** |
+| Translation | **Local NMT** by default: NLLB-200 600M int8 running in CTranslate2, compiled into the app. It's offline, needs no key, and uses about 630 MB on disk. Also available: **Google** (free, with MyMemory as a fallback when Google blocks), **Claude** (API key), or **YouTube's automatic translation**. |
+| Progressive display | With the local NMT, each Whisper segment is translated and shown as soon as it's transcribed. Changing the target language doesn't re-run Whisper: the transcript is cached separately. |
 | Gender and proper names | With Claude: the **VOIX** (who is speaking) and **À QUI** (who is addressed or talked about) choices set the grammatical agreement (Arabic أنتَ/أنتِ, French agreement…). Proper names are kept or transliterated. Google translates line by line and can't take this into account. |
 
 Results are cached in `~/Library/Caches/youtube-live-translator/`. Settings are stored in `~/Library/Application Support/youtube-live-translator/config.json`.

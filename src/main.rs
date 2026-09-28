@@ -4,6 +4,7 @@
 //! `ytlt`           ouvre la fenêtre
 //! `ytlt --server`  lance uniquement le serveur local (pour tester dans un navigateur)
 
+mod nmt;
 mod server;
 mod subs;
 mod translate;
@@ -49,6 +50,22 @@ fn start_server() -> Result<SocketAddr> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--setup") {
+        // Utilisé par l'installateur : télécharge les modèles une fois pour toutes.
+        let rt = tokio::runtime::Runtime::new()?;
+        let last = std::sync::Mutex::new(String::new());
+        let progress: translate::Progress = std::sync::Arc::new(move |f, msg: String| {
+            let line = format!("[{:>3.0}%] {msg}", f * 100.0);
+            let mut last = last.lock().unwrap();
+            if *last != line {
+                println!("{line}");
+                *last = line;
+            }
+        });
+        rt.block_on(server::setup_models(progress))?;
+        println!("Modèles installés.");
+        return Ok(());
+    }
     let addr = start_server()?;
     let url = format!("http://{addr}/");
 

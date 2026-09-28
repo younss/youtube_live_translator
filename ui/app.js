@@ -88,8 +88,14 @@ async function refreshStatus() {
     const s = await api("/api/status");
     const dep = (ok, name) => `<span class="${ok ? "ok" : "ko"}">${ok ? "●" : "○"} ${name}</span>`;
     $("statusDeps").innerHTML = [dep(s.ytdlp, "yt-dlp"), dep(s.ffmpeg, "ffmpeg"), dep(s.whisper, "whisper"),
-      dep(s.claude_key, "clé Claude")].join(" &nbsp; ");
+      dep(s.nmt_ready, "NMT local"), dep(s.claude_key, "clé Claude")].join(" &nbsp; ");
     $("whisperModel").value = s.whisper_model;
+    if (s.setup && (s.setup.running || s.setup.message.startsWith("Échec"))) {
+      setProgress(s.setup.progress, s.setup.message.toUpperCase(), s.setup.running ? "busy" : "error");
+      if (s.setup.running) setTimeout(refreshStatus, 1500);
+    } else if (s.setup && s.setup.message === "Modèles prêts" && $("progressText").textContent.startsWith("INSTALLATION")) {
+      setProgress(1, "MODÈLES PRÊTS");
+    }
     $("keyState").textContent = s.claude_key ? "Une clé est configurée." : "Aucune clé : le traducteur Claude est indisponible.";
     return s;
   } catch (e) {
@@ -106,7 +112,7 @@ function fillLangs() {
   $("srcLang").value = prefs.src || "auto";
   $("dstLang").value = prefs.dst || "fr";
   $("mode").value = prefs.mode || "auto";
-  $("translator").value = prefs.translator || "google";
+  $("translator").value = prefs.translator || "local";
   $("voice").value = prefs.voice || "auto";
   $("addressee").value = prefs.addressee || "auto";
   $("fontSize").value = prefs.fontSize || 28;
@@ -375,11 +381,23 @@ async function generate(refresh = false) {
   setProgress(0.01, "DÉMARRAGE…", "busy");
   try {
     const { id } = await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
+    let partialRev = 0;
     for (;;) {
       await new Promise((r) => setTimeout(r, 500));
       if (token !== state.jobToken) return; // remplacé par une nouvelle demande
       const job = await api("/api/jobs/" + id);
-      if (job.state === "running") { setProgress(job.progress, job.stage.toUpperCase(), "busy"); continue; }
+      if (job.state === "running") {
+        setProgress(job.progress, job.stage.toUpperCase(), "busy");
+        // Affichage progressif : les sous-titres déjà traduits s'affichent sans attendre la fin.
+        if (job.partial && job.partial_rev !== partialRev) {
+          partialRev = job.partial_rev;
+          state.cues = job.partial;
+          shownCue = -2;
+          renderTranscript();
+          $("tagCues").textContent = state.cues.length + " CUES…";
+        }
+        continue;
+      }
       if (job.state === "error") throw new Error(job.error);
       const r = job.result;
       if (r.video_id !== state.videoId) return;
@@ -615,7 +633,7 @@ $("offset").addEventListener("input", (e) => {
 });
 $("offset").addEventListener("dblclick", (e) => { e.target.value = 0; e.target.dispatchEvent(new Event("input")); });
 for (const id of ["srcLang", "dstLang", "mode", "translator", "voice", "addressee"]) $(id).addEventListener("change", () => {
-  if ((id === "voice" || id === "addressee") && $("translator").value !== "claude") toast("Genre pris en compte par le traducteur Claude uniquement");
+  if ((id === "voice" || id === "addressee") && $("translator").value !== "claude") toast("Genre (il/elle) pris en compte par le traducteur Claude uniquement");
   savePrefs();
   if (state.videoId && $("translator").value !== "claude") generate();
 });
