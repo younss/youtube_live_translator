@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "ytlt-server", "runtimeExecutable": "cargo", "runtimeArgs": ["run", "--", "--server"], "port": 47653 }
+  ]
+}
