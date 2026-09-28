@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -50,6 +50,7 @@ struct AppState {
     next_id: Arc<AtomicU64>,
     config: Arc<Mutex<Config>>,
     streams: Arc<Mutex<HashMap<String, (std::time::Instant, youtube::Streams)>>>,
+    http: reqwest::Client,
     cache_dir: PathBuf,
     config_path: PathBuf,
 }
@@ -73,6 +74,7 @@ impl AppState {
             next_id: Arc::new(AtomicU64::new(1)),
             config: Arc::new(Mutex::new(config)),
             streams: Default::default(),
+            http: reqwest::Client::new(),
             cache_dir,
             config_path,
         }
@@ -98,7 +100,9 @@ pub fn router() -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/search", get(search))
         .route("/api/stream/{id}", get(stream))
+        .route("/api/media/{key}/{kind}", get(media))
         .route("/api/export", post(export_srt))
+        .route("/api/log", post(client_log))
         .fallback(static_file)
         .with_state(AppState::new())
 }
@@ -354,6 +358,9 @@ fn align(mut translated: Vec<Cue>, original: &[Cue]) -> Vec<Cue> {
 struct StreamReq {
     #[serde(default = "default_height")]
     q: u32,
+    /// Le client sait lire le HLS nativement (WebKit / Safari).
+    #[serde(default)]
+    hls: bool,
 }
 
 fn default_height() -> u32 {
@@ -361,21 +368,156 @@ fn default_height() -> u32 {
 }
 
 /// Les URL googlevideo expirent au bout de ~6 h ; on les garde 1 h en mémoire.
+/// Le navigateur reçoit des URL locales (`/api/media/…`) servies par [`media`].
 async fn stream(State(st): State<AppState>, UrlPath(id): UrlPath<String>, Query(q): Query<StreamReq>) -> Response {
     let Some(id) = youtube::video_id(&id) else { return err(StatusCode::BAD_REQUEST, "identifiant invalide") };
-    let key = format!("{id}@{}", q.q);
-    if let Some((at, s)) = st.streams.lock().unwrap().get(&key) {
-        if at.elapsed().as_secs() < 3600 {
-            return Json(s.clone()).into_response();
+    if q.hls {
+        let key = format!("{id}-hls");
+        let cached = st.streams.lock().unwrap().get(&key).filter(|(at, _)| at.elapsed().as_secs() < 3600).cloned();
+        if let Some((_, s)) = cached {
+            return Json(s).into_response();
+        }
+        match youtube::hls_master(&id).await {
+            Ok(s) => {
+                st.streams.lock().unwrap().insert(key, (std::time::Instant::now(), s.clone()));
+                return Json(s).into_response();
+            }
+            // Pas de HLS : on retombe sur les flux séparés via le proxy.
+            Err(e) => eprintln!("HLS indisponible pour {id} : {e:#}"),
         }
     }
-    match youtube::streams(&id, q.q).await {
-        Ok(s) => {
-            st.streams.lock().unwrap().insert(key, (std::time::Instant::now(), s.clone()));
-            Json(s).into_response()
-        }
-        Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    let key = format!("{id}-{}", q.q);
+    let cached = st.streams.lock().unwrap().get(&key).filter(|(at, _)| at.elapsed().as_secs() < 3600).cloned();
+    let s = match cached {
+        Some((_, s)) => s,
+        None => match youtube::streams(&id, q.q).await {
+            Ok(s) => {
+                st.streams.lock().unwrap().insert(key.clone(), (std::time::Instant::now(), s.clone()));
+                s
+            }
+            Err(e) => return err(StatusCode::BAD_GATEWAY, e),
+        },
+    };
+    // Les manifestes HLS (directs) sont lus tels quels : WebKit les gère nativement.
+    if s.hls {
+        return Json(s).into_response();
     }
+    let local = youtube::Streams {
+        video: format!("/api/media/{key}/v"),
+        audio: s.audio.as_ref().map(|_| format!("/api/media/{key}/a")),
+        ..s
+    };
+    Json(local).into_response()
+}
+
+/// Taille des requêtes envoyées à googlevideo : au-delà de ~10 Mo par requête,
+/// YouTube bride ou coupe la connexion (c'est ce que fait aussi yt-dlp).
+const CHUNK: u64 = 8 << 20;
+
+/// Proxy HTTP avec prise en charge des requêtes `Range` pour les flux googlevideo.
+/// WebKit (AVFoundation) demande de très grandes plages que YouTube coupe ;
+/// on les découpe en morceaux de [`CHUNK`] octets enchaînés dans une seule réponse.
+async fn media(State(st): State<AppState>, UrlPath((key, kind)): UrlPath<(String, String)>, headers: HeaderMap) -> Response {
+    let upstream = {
+        let map = st.streams.lock().unwrap();
+        map.get(&key).and_then(|(_, s)| if kind == "a" { s.audio.clone() } else { Some(s.video.clone()) })
+    };
+    let Some(url) = upstream else { return err(StatusCode::NOT_FOUND, "flux expiré — rouvrez la vidéo") };
+
+    let param = |name: &str| {
+        url.split(['?', '&'])
+            .find_map(|p| p.strip_prefix(&format!("{name}=")))
+            .map(|v| urlencoding::decode(v).map(|c| c.into_owned()).unwrap_or_default())
+    };
+    let mime = param("mime").unwrap_or_else(|| if kind == "a" { "audio/mp4".into() } else { "video/mp4".into() });
+    let total = match param("clen").and_then(|c| c.parse::<u64>().ok()) {
+        Some(n) => n,
+        None => match probe_length(&st.http, &url).await {
+            Ok(n) => n,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, e),
+        },
+    };
+
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).and_then(|r| parse_range(r, total));
+    let (start, end) = range.unwrap_or((0, total.saturating_sub(1)));
+    if start >= total || start > end {
+        return (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{total}"))]).into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    let http = st.http.clone();
+    tokio::spawn(async move {
+        let mut pos = start;
+        while pos <= end {
+            let to = (pos + CHUNK - 1).min(end);
+            let resp = http.get(&url).header(header::RANGE, format!("bytes={pos}-{to}")).send().await;
+            let mut resp = match resp.and_then(|r| r.error_for_status()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e))).await;
+                    return;
+                }
+            };
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(bytes)) => {
+                        pos += bytes.len() as u64;
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            return; // le lecteur a fermé la connexion (seek, pause…)
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(std::io::Error::other(e))).await;
+                        return;
+                    }
+                }
+            }
+            if pos <= to {
+                // Réponse plus courte que prévu : on repart de là où on en est.
+                continue;
+            }
+        }
+    });
+
+    let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let status = if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let mut resp = (status, body).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, mime.parse().unwrap_or(header::HeaderValue::from_static("video/mp4")));
+    h.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+    h.insert(header::CONTENT_LENGTH, (end - start + 1).into());
+    if range.is_some() {
+        if let Ok(v) = format!("bytes {start}-{end}/{total}").parse() {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    resp
+}
+
+/// `bytes=a-b`, `bytes=a-` ou `bytes=-n` → plage inclusive bornée à la taille du fichier.
+fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = header.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    let last = total.checked_sub(1)?;
+    match (a.trim(), b.trim()) {
+        ("", n) => {
+            let n: u64 = n.parse().ok()?;
+            Some((total.saturating_sub(n), last))
+        }
+        (a, "") => Some((a.parse().ok()?, last)),
+        (a, b) => Some((a.parse().ok()?, b.parse::<u64>().ok()?.min(last))),
+    }
+}
+
+async fn probe_length(http: &reqwest::Client, url: &str) -> Result<u64> {
+    let resp = http.get(url).header(header::RANGE, "bytes=0-0").send().await?.error_for_status()?;
+    resp.headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| anyhow!("taille du flux inconnue"))
 }
 
 #[derive(Deserialize)]
@@ -388,6 +530,12 @@ async fn search(Query(q): Query<SearchReq>) -> Response {
         Ok(hits) => Json(hits).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, e),
     }
+}
+
+/// Les erreurs JavaScript de la webview sont renvoyées ici pour apparaître dans le terminal.
+async fn client_log(body: String) -> StatusCode {
+    eprintln!("[ui] {}", body.chars().take(2000).collect::<String>());
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Deserialize)]
@@ -420,5 +568,19 @@ async fn export_srt(Json(req): Json<ExportReq>) -> Response {
     match tokio::fs::write(&path, srt).await {
         Ok(()) => Json(json!({ "path": path })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn ranges() {
+        assert_eq!(parse_range("bytes=0-1", 100), Some((0, 1)));
+        assert_eq!(parse_range("bytes=10-", 100), Some((10, 99)));
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=50-500", 100), Some((50, 99)));
+        assert_eq!(parse_range("items=0-1", 100), None);
     }
 }

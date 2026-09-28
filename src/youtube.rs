@@ -208,6 +208,28 @@ pub async fn streams(id: &str, max_height: u32) -> Result<Streams> {
     Ok(Streams { title, is_live, audio: urls.get(1).cloned(), video, hls })
 }
 
+/// Manifeste HLS « maître » (audio + vidéo, qualité adaptative). WebKit le lit nativement,
+/// sans les coupures qu'il a sur les MP4 fragmentés de YouTube.
+pub async fn hls_master(id: &str) -> Result<Streams> {
+    let mut cmd = ytdlp()?;
+    cmd.args(["-J", "--no-warnings", "--no-playlist"]).arg(watch_url(id));
+    let json: serde_json::Value = serde_json::from_str(&run(cmd).await?)?;
+    let manifest = json["formats"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["manifest_url"].as_str())
+        .find(|u| u.contains("m3u8") || u.contains("/manifest/hls"))
+        .ok_or_else(|| anyhow!("pas de flux HLS pour cette vidéo"))?;
+    Ok(Streams {
+        title: json["title"].as_str().unwrap_or_default().to_string(),
+        is_live: json["is_live"].as_bool().unwrap_or(false),
+        video: manifest.to_string(),
+        audio: None,
+        hls: true,
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub id: String,

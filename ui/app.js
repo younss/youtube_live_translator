@@ -15,16 +15,16 @@ const store = {
 };
 
 // ------------------------------------------------------------ IPC fenêtre
-function ipc(msg) {
+function sendIpc(msg) {
   if (window.ipc && window.ipc.postMessage) { window.ipc.postMessage(msg); return true; }
   return false;
 }
 document.querySelectorAll("[data-ipc]").forEach((b) => b.addEventListener("click", () => {
-  if (!ipc(b.dataset.ipc) && b.dataset.ipc === "close") window.close();
+  if (!sendIpc(b.dataset.ipc) && b.dataset.ipc === "close") window.close();
 }));
-$("titlebar").addEventListener("mousedown", (e) => { if (!e.target.closest("button") && e.button === 0) ipc("drag"); });
-$("titlebar").addEventListener("dblclick", (e) => { if (!e.target.closest("button")) ipc("max"); });
-$("grip").addEventListener("mousedown", (e) => { if (e.button === 0) ipc("resize"); });
+$("titlebar").addEventListener("mousedown", (e) => { if (!e.target.closest("button") && e.button === 0) sendIpc("drag"); });
+$("titlebar").addEventListener("dblclick", (e) => { if (!e.target.closest("button")) sendIpc("max"); });
+$("grip").addEventListener("mousedown", (e) => { if (e.button === 0) sendIpc("resize"); });
 
 // ------------------------------------------------------------ état
 const state = {
@@ -137,29 +137,53 @@ function applySubStyle() {
 // YouTube ne sert presque plus de flux combinés : on lit la vidéo H.264 et l'audio AAC
 // dans deux éléments synchronisés (la vidéo est l'horloge maîtresse).
 class NativePlayer {
+  // Horloge maîtresse = l'audio (une coupure de son s'entend, une image sautée se voit à peine).
+  // On ne repositionne jamais l'audio sauf quand l'utilisateur cherche ; c'est la vidéo qui suit.
   constructor(video, audio, onState) {
     this.v = video; this.a = audio; this.onState = onState;
-    this.hasAudio = false; this.want = false; this.title = ""; this.loaded = false; this.hls = null;
+    this.hasAudio = false; this.want = false; this.title = ""; this.loaded = false; this.hls = null; this.rate = 1;
     const v = video, a = audio;
-    v.addEventListener("play", () => { if (this.hasAudio) a.play().catch(() => {}); onState(1); });
-    v.addEventListener("playing", () => { if (this.hasAudio && a.paused) a.play().catch(() => {}); onState(1); });
-    v.addEventListener("pause", () => { if (this.hasAudio) a.pause(); if (!v.ended) onState(2); });
-    v.addEventListener("waiting", () => { if (this.hasAudio) a.pause(); });
-    v.addEventListener("seeking", () => { if (this.hasAudio) a.currentTime = v.currentTime; });
-    v.addEventListener("ratechange", () => { a.playbackRate = v.playbackRate; });
-    v.addEventListener("ended", () => onState(0));
-    v.addEventListener("timeupdate", () => {
-      if (this.hasAudio && !v.paused && Math.abs(a.currentTime - v.currentTime) > 0.3) a.currentTime = v.currentTime;
-    });
-    // Si l'audio manque de données, on attend avec la vidéo.
-    a.addEventListener("waiting", () => { if (this.want && !v.paused) { this.audioStall = true; v.pause(); } });
-    a.addEventListener("canplay", () => { if (this.audioStall) { this.audioStall = false; v.play().catch(() => {}); } });
-    v.addEventListener("error", () => this.onError?.(v.error));
+    const master = () => this.master();
+
+    for (const el of [v, a]) {
+      // WebKit annule un play() lancé avant que le flux soit prêt : on relance dès qu'il l'est.
+      el.addEventListener("canplay", () => { if (this.want && el.paused) el.play().catch(() => {}); });
+      el.addEventListener("error", () => {
+        window.__log?.(`${el === v ? "video" : "audio"} error ${el.error?.code} ${el.error?.message}`);
+        if (el === v) this.onError?.(v.error);
+      });
+    }
+    v.addEventListener("loadedmetadata", () => onState(this.want ? 1 : 2));
+    const report = () => onState(master().ended ? 0 : master().paused ? 2 : 1);
+    for (const ev of ["play", "playing", "pause"]) {
+      v.addEventListener(ev, () => { if (!this.hasAudio) report(); });
+      a.addEventListener(ev, () => { if (this.hasAudio) report(); });
+    }
+    v.addEventListener("ended", () => { if (!this.hasAudio) onState(0); });
+    a.addEventListener("ended", () => { if (this.hasAudio) { v.pause(); onState(0); } });
+
+    // Si l'audio attend des données, la vidéo l'attend ; elle repart avec lui.
+    a.addEventListener("waiting", () => { if (this.hasAudio) v.pause(); });
+    a.addEventListener("playing", () => { if (this.hasAudio && this.want && v.paused) v.play().catch(() => {}); });
+
+    // Synchronisation douce : on ajuste la vitesse de la vidéo, saut seulement si > 1 s d'écart.
+    setInterval(() => {
+      if (!this.hasAudio || !this.loaded || a.paused || v.seeking) return;
+      const drift = v.currentTime - a.currentTime;
+      if (Math.abs(drift) > 1) v.currentTime = a.currentTime;
+      else if (Math.abs(drift) > 0.08) v.playbackRate = this.rate * (drift > 0 ? 0.95 : 1.05);
+      else if (v.playbackRate !== this.rate) v.playbackRate = this.rate;
+      if (v.paused && this.want && v.readyState >= 2) v.play().catch(() => {});
+    }, 250);
   }
+  master() { return this.hasAudio ? this.a : this.v; }
   async load(id, quality) {
     this.loaded = false; this.want = true;
     this.hls?.destroy(); this.hls = null;
-    const s = await api(`/api/stream/${id}?q=${quality}`);
+    this.v.pause(); this.a.pause();
+    // WebKit (l'app) lit mal les MP4 fragmentés de YouTube mais parfaitement le HLS.
+    const nativeHls = !!this.v.canPlayType("application/vnd.apple.mpegurl");
+    const s = await api(`/api/stream/${id}?q=${quality}&hls=${nativeHls}`);
     this.title = s.title;
     this.hasAudio = !!s.audio;
     this.v.muted = this.hasAudio;
@@ -171,28 +195,34 @@ class NativePlayer {
     } else {
       this.v.src = s.video;
     }
-    this.a.src = s.audio || "";
-    if (!s.audio) this.a.removeAttribute("src");
+    if (s.audio) this.a.src = s.audio; else this.a.removeAttribute("src");
     this.loaded = true;
     this.applyVolume();
-    await this.v.play().catch(() => this.onState(2));
+    this.startBoth();
     return s;
   }
-  out() { return this.hasAudio ? this.a : this.v; }
-  applyVolume() { this.out().volume = state.volume / 100; this.out().muted = state.muted; if (this.hasAudio) this.v.muted = true; }
-  getCurrentTime() { return this.v.currentTime || 0; }
-  getDuration() { return isFinite(this.v.duration) ? this.v.duration : 0; }
-  seekTo(t) { this.v.currentTime = t; if (this.hasAudio) this.a.currentTime = t; }
-  playVideo() { this.want = true; this.v.play().catch(() => {}); }
-  pauseVideo() { this.want = false; this.v.pause(); }
+  startBoth() {
+    for (const el of this.hasAudio ? [this.a, this.v] : [this.v]) {
+      el.play().catch((e) => {
+        // AbortError = chargement pas encore prêt ; « canplay » relancera.
+        if (e.name !== "AbortError") { window.__log?.("play() refusé : " + e.name + " " + e.message); this.want = false; this.onState(2); }
+      });
+    }
+  }
+  applyVolume() { this.master().volume = state.volume / 100; this.master().muted = state.muted; if (this.hasAudio) this.v.muted = true; }
+  getCurrentTime() { return this.master().currentTime || 0; }
+  getDuration() { const d = this.master().duration; return isFinite(d) ? d : 0; }
+  seekTo(t) { this.a.currentTime = t; this.v.currentTime = t; }
+  playVideo() { this.want = true; this.startBoth(); }
+  pauseVideo() { this.want = false; this.a.pause(); this.v.pause(); }
   stopVideo() { this.pauseVideo(); this.seekTo(0); this.onState(-1); }
-  getPlayerState() { return !this.loaded ? -1 : this.v.ended ? 0 : this.v.paused ? 2 : 1; }
+  getPlayerState() { const m = this.master(); return !this.loaded ? -1 : m.ended ? 0 : m.paused ? 2 : 1; }
   setVolume() { this.applyVolume(); }
-  mute() { this.out().muted = true; }
-  unMute() { this.out().muted = false; }
-  setPlaybackRate(r) { this.v.playbackRate = r; }
+  mute() { this.master().muted = true; }
+  unMute() { this.master().muted = false; }
+  setPlaybackRate(r) { this.rate = r; this.a.playbackRate = r; this.v.playbackRate = r; }
   getVideoLoadedFraction() {
-    const b = this.v.buffered, d = this.getDuration();
+    const b = this.master().buffered, d = this.getDuration();
     return b.length && d ? b.end(b.length - 1) / d : 0;
   }
   getVideoData() { return { title: this.title, author: "" }; }
@@ -536,7 +566,7 @@ function toggleFullscreen() {
   const app = $("app");
   const on = !app.classList.contains("theater");
   app.classList.toggle("theater", on);
-  if (!ipc("fs")) {
+  if (!sendIpc("fs")) {
     if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
     else if (!on && document.fullscreenElement) document.exitFullscreen();
   }

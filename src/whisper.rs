@@ -111,10 +111,32 @@ pub async fn transcribe(model: &Path, wav: &Path, lang: &str, progress: &Progres
     Ok(out
         .transcription
         .into_iter()
-        .filter(|s| !s.text.trim().is_empty())
+        .filter(|s| !s.text.trim().is_empty() && !is_hallucination(&s.text))
         .map(|s| {
             let text = s.text.trim().to_string();
             Cue { start: s.offsets.from / 1000.0, end: s.offsets.to / 1000.0, orig: text.clone(), text }
         })
         .collect())
+}
+
+/// Sur la musique ou le silence, Whisper « invente » des crédits de sous-titrage
+/// appris dans ses données d'entraînement. On les retire.
+fn is_hallucination(text: &str) -> bool {
+    const PATTERNS: [&str; 14] = [
+        "ترجمة", "الترجمة", "اشترك", "sous-titr", "sous titr", "subtitles by", "subtitled by",
+        "altyazı", "untertitel", "subtítulos", "amara.org", "thanks for watching", "merci d'avoir regardé",
+        "abone ol",
+    ];
+    let t = text.to_lowercase();
+    t.chars().filter(|c| c.is_alphabetic()).count() < 2 || PATTERNS.iter().any(|p| t.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn filters_credit_hallucinations() {
+        assert!(super::is_hallucination("Sous-titres réalisés par la communauté d'Amara.org"));
+        assert!(super::is_hallucination("♪"));
+        assert!(!super::is_hallucination("Bonjour à tous"));
+    }
 }

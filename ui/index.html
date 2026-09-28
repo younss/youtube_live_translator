@@ -7,6 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
+<script>
+  // Remonte les erreurs JS au serveur local (visibles dans le terminal).
+  window.__log = (m) => { try { navigator.sendBeacon("/api/log", String(m)); } catch (e) {} };
+  addEventListener("error", (e) => window.__log(`${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`));
+  addEventListener("unhandledrejection", (e) => window.__log("promise: " + (e.reason && (e.reason.stack || e.reason))));
+</script>
 </head>
 <body>
 <div id="app">
