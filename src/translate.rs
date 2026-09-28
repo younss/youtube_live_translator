@@ -30,6 +30,16 @@ pub enum Engine {
 
 pub type Progress = Arc<dyn Fn(f32, String) + Send + Sync>;
 
+/// Ce que le traducteur doit savoir en plus des lignes : de quoi parle la vidéo et qui parle.
+#[derive(Clone, Debug, Default)]
+pub struct TranslationContext {
+    pub title: String,
+    /// Qui parle : "auto", "female" ou "male".
+    pub voice: String,
+    /// À qui / de qui on parle : "auto", "female" ou "male".
+    pub addressee: String,
+}
+
 /// Traduit `cue.orig` vers `target` et remplit `cue.text`.
 pub async fn translate_cues(
     cues: &mut [Cue],
@@ -37,8 +47,10 @@ pub async fn translate_cues(
     target: &str,
     engine: Engine,
     api_key: Option<String>,
+    context: TranslationContext,
     progress: Progress,
 ) -> Result<()> {
+    let context = Arc::new(context);
     let batch_size = match engine {
         Engine::Google => 25,
         Engine::Claude => 80,
@@ -56,7 +68,7 @@ pub async fn translate_cues(
     let key = api_key.map(Arc::new);
     let mut set = JoinSet::new();
     for (offset, batch) in batches {
-        let (http, limit, key) = (http.clone(), limit.clone(), key.clone());
+        let (http, limit, key, context) = (http.clone(), limit.clone(), key.clone(), context.clone());
         let (source, target) = (source.to_string(), target.to_string());
         set.spawn(async move {
             let _permit = limit.acquire_owned().await?;
@@ -64,7 +76,7 @@ pub async fn translate_cues(
                 Engine::Google => google_batch(&http, &batch, &source, &target).await,
                 Engine::Claude => {
                     let key = key.ok_or_else(|| anyhow!("Aucune clé API Claude configurée (Réglages ou ANTHROPIC_API_KEY)"))?;
-                    claude_batch(&http, &key, &batch, &source, &target).await
+                    claude_batch(&http, &key, &batch, &source, &target, &context).await
                 }
             }?;
             anyhow::Ok((offset, out))
@@ -124,14 +136,42 @@ async fn google_one(http: &reqwest::Client, text: &str, source: &str, target: &s
 
 const CLAUDE_MODEL: &str = "claude-opus-5";
 
-async fn claude_batch(http: &reqwest::Client, key: &str, lines: &[String], source: &str, target: &str) -> Result<Vec<String>> {
+async fn claude_batch(
+    http: &reqwest::Client,
+    key: &str,
+    lines: &[String],
+    source: &str,
+    target: &str,
+    context: &TranslationContext,
+) -> Result<Vec<String>> {
     let from = if source == "auto" { "the detected source language".to_string() } else { lang_name(source).to_string() };
+    let voice = match context.voice.as_str() {
+        "female" => "The speaker (or singer) is a woman: when she refers to herself, use feminine grammatical forms \
+                     (adjectives, participles, verb agreement) wherever the target language marks gender.",
+        "male" => "The speaker (or singer) is a man: when he refers to himself, use masculine grammatical forms \
+                   wherever the target language marks gender.",
+        _ => "Infer the speaker's gender from the video title and the lines (e.g. a known female singer) and use the \
+              matching grammatical forms when they refer to themselves; if it cannot be inferred, prefer neutral wording.",
+    };
+    let addressee = match context.addressee.as_str() {
+        "female" => "The person being addressed or talked about (\"you\", \"he/she\") is a woman: use feminine forms \
+                     for her (e.g. Arabic أنتِ and feminine verb endings, French feminine agreement).",
+        "male" => "The person being addressed or talked about (\"you\", \"he/she\") is a man: use masculine forms \
+                   for him (e.g. Arabic أنتَ and masculine verb endings, French masculine agreement).",
+        _ => "The source language may not mark gender (Turkish has no gendered pronouns), but the target may require it: \
+              infer the gender of the person being addressed or talked about from the whole context (title, speaker, \
+              story of the lyrics) and use it consistently across all lines.",
+    };
     let system = format!(
-        "You translate video subtitles from {from} into {to}. You receive a JSON array of subtitle lines in order; \
-         they are consecutive fragments of spoken speech, so use the surrounding lines as context. \
+        "You translate video subtitles from {from} into {to}. The video is titled \"{title}\". \
+         You receive a JSON array of subtitle lines in order; they are consecutive fragments of speech or song \
+         lyrics, so use the surrounding lines as context. {voice} {addressee} \
+         Never translate proper names (people, places, brands, song titles): keep them as they are, or transliterate \
+         them phonetically when the target language uses another script (e.g. Arabic). \
          Return exactly one translation per input line, in the same order, keeping each line short and natural \
-         for on-screen reading. Never merge, split, skip or add lines. Keep names, numbers and brands as-is.",
-        to = lang_name(target)
+         for on-screen reading. Never merge, split, skip or add lines.",
+        to = lang_name(target),
+        title = context.title.replace('"', "'"),
     );
     let body = json!({
         "model": CLAUDE_MODEL,

@@ -155,6 +155,22 @@
               </select>
             </label>
           </div>
+          <div class="opt-row">
+            <label title="Accords grammaticaux (il/elle) — pris en compte par le traducteur Claude">VOIX
+              <select id="voice">
+                <option value="auto">Auto (d'après le titre)</option>
+                <option value="female">Une femme parle / chante</option>
+                <option value="male">Un homme parle / chante</option>
+              </select>
+            </label>
+            <label title="Genre de la personne à qui l'on parle ou dont on parle (tu / il / elle)">À QUI
+              <select id="addressee">
+                <option value="auto">Auto (d'après le contexte)</option>
+                <option value="female">À / d'une femme</option>
+                <option value="male">À / d'un homme</option>
+              </select>
+            </label>
+          </div>
           <div class="sliders">
             <div class="slider-col"><input type="range" id="fontSize" min="16" max="56" value="28" orient="vertical"><span>TAILLE</span></div>
             <div class="slider-col"><input type="range" id="subPos" min="2" max="40" value="8" orient="vertical"><span>HAUT.</span></div>

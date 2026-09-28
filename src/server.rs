@@ -180,6 +180,16 @@ struct JobReq {
     translator: String,
     #[serde(default)]
     refresh: bool,
+    /// Qui parle : "auto", "female" ou "male" (accords grammaticaux de la traduction).
+    #[serde(default = "default_voice")]
+    voice: String,
+    /// À qui / de qui on parle, mêmes valeurs.
+    #[serde(default = "default_voice")]
+    addressee: String,
+}
+
+fn default_voice() -> String {
+    "auto".into()
 }
 
 async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Response {
@@ -232,8 +242,8 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
     }
     let work = st.cache_dir.join("work");
     let cache_file = st.cache_dir.join("subs").join(format!(
-        "{id}_{}_{}_{}_{}.json",
-        req.mode, req.source, target, req.translator
+        "{id}_{}_{}_{}_{}_{}_{}.json",
+        req.mode, req.source, target, req.translator, req.voice, req.addressee
     ));
     if !req.refresh {
         if let Ok(s) = tokio::fs::read_to_string(&cache_file).await {
@@ -298,7 +308,12 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress) -> Result
                 let sub: Progress = Arc::new(move |f, s| p(0.6 + 0.39 * f, s));
                 sub(0.0, format!("Traduction via {translator}…"));
                 let src = if source_lang == "auto" { "auto".to_string() } else { base(&source_lang) };
-                translate::translate_cues(&mut cues, &src, target, engine, st.api_key(), sub).await?;
+                let context = translate::TranslationContext {
+                    title: meta.title.clone(),
+                    voice: req.voice.clone(),
+                    addressee: req.addressee.clone(),
+                };
+                translate::translate_cues(&mut cues, &src, target, engine, st.api_key(), context, sub).await?;
             }
         }
     }

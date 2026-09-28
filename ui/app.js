@@ -107,6 +107,8 @@ function fillLangs() {
   $("dstLang").value = prefs.dst || "fr";
   $("mode").value = prefs.mode || "auto";
   $("translator").value = prefs.translator || "google";
+  $("voice").value = prefs.voice || "auto";
+  $("addressee").value = prefs.addressee || "auto";
   $("fontSize").value = prefs.fontSize || 28;
   $("subPos").value = prefs.subPos || 8;
   $("subBg").value = prefs.subBg ?? 55;
@@ -118,7 +120,7 @@ function fillLangs() {
 
 function savePrefs() {
   store.set("prefs", {
-    src: $("srcLang").value, dst: $("dstLang").value, mode: $("mode").value, translator: $("translator").value,
+    src: $("srcLang").value, dst: $("dstLang").value, mode: $("mode").value, translator: $("translator").value, voice: $("voice").value, addressee: $("addressee").value,
     engine: $("engine").value, quality: $("quality").value,
     fontSize: $("fontSize").value, subPos: $("subPos").value, subBg: $("subBg").value, dual: isOn("btnDual"),
   });
@@ -367,7 +369,7 @@ async function generate(refresh = false) {
   const token = ++state.jobToken;
   const body = {
     url: state.videoId, source: $("srcLang").value, target: $("dstLang").value,
-    mode: $("mode").value, translator: $("translator").value, refresh,
+    mode: $("mode").value, translator: $("translator").value, voice: $("voice").value, addressee: $("addressee").value, addressee: $("addressee").value, refresh,
   };
   $("btnGen").disabled = true;
   setProgress(0.01, "DÉMARRAGE…", "busy");
@@ -612,7 +614,8 @@ $("offset").addEventListener("input", (e) => {
   $("offsetLabel").textContent = `SYNC ${state.offset > 0 ? "+" : ""}${state.offset.toFixed(1)}s`;
 });
 $("offset").addEventListener("dblclick", (e) => { e.target.value = 0; e.target.dispatchEvent(new Event("input")); });
-for (const id of ["srcLang", "dstLang", "mode", "translator"]) $(id).addEventListener("change", () => {
+for (const id of ["srcLang", "dstLang", "mode", "translator", "voice", "addressee"]) $(id).addEventListener("change", () => {
+  if ((id === "voice" || id === "addressee") && $("translator").value !== "claude") toast("Genre pris en compte par le traducteur Claude uniquement");
   savePrefs();
   if (state.videoId && $("translator").value !== "claude") generate();
 });

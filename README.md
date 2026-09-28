@@ -6,8 +6,12 @@ A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It pl
 
 ```bash
 brew install yt-dlp ffmpeg whisper-cpp
-cargo run --release
+./scripts/install.sh        # builds the app and copies it into /Applications
 ```
+
+- `./scripts/dmg.sh` builds `target/YouTube-Live-Translator.dmg`: open it and drag the app onto Applications.
+- `./scripts/bundle.sh` builds `target/YouTube Live Translator.app` only.
+- The icon is drawn by `scripts/make_icon.swift` (→ `assets/icon.png`).
 
 `cargo run -- --server` starts only the local server (http://127.0.0.1:47653) so you can test in a regular browser.
 
@@ -18,6 +22,7 @@ cargo run --release
 | Playback | **Native** player: yt-dlp resolves the H.264 + AAC streams, which play in synced `<video>`/`<audio>` elements. The YouTube iframe is kept as a fallback (the "YOUTUBE" menu). |
 | Source subtitles | 1. YouTube subtitles (manual first, otherwise automatic) 2. otherwise a **local Whisper** transcription (whisper.cpp; the model downloads automatically on first use) |
 | Translation | **Google** (free, no key), **Claude** (Anthropic API key in ⚙ Settings or `ANTHROPIC_API_KEY`), or **YouTube's automatic translation** |
+| Gender and proper names | With Claude: the **VOIX** (who is speaking) and **À QUI** (who is addressed or talked about) choices set the grammatical agreement (Arabic أنتَ/أنتِ, French agreement…). Proper names are kept or transliterated. Google translates line by line and can't take this into account. |
 
 Results are cached in `~/Library/Caches/youtube-live-translator/`. Settings are stored in `~/Library/Application Support/youtube-live-translator/config.json`.
 
