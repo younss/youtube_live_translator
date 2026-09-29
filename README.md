@@ -322,6 +322,11 @@ YouTube URL
 - Word-level timestamps make each line appear when it's spoken, not during the silence before it. A corrupted audio frame is replaced with silence of the same length, so the timeline doesn't shift.
 - For translation, lines are regrouped into whole sentences (split on punctuation and pauses) and translated with that context. The translation is then spread back over the lines of the sentence.
 
+**Playhead first:**
+- The app tells the server where you are in the video, and Whisper transcribes that spot first (the next 3 minutes), then fills in the rest.
+- On a 2-hour episode, if you jump to 1:15:00, subtitles appear there in about 45 s, without waiting for the rest.
+- A single transcription runs per video. If you change language along the way, the new job joins it and translates what's already transcribed, without re-running Whisper.
+
 **Memory:**
 - Whisper is freed at the end of each transcription.
 - The NMT is freed after 1 minute idle.

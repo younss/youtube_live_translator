@@ -111,7 +111,9 @@ struct AppState {
     http: reqwest::Client,
     /// Un verrou par transcription (vidéo + mode + langue source) : un seul Whisper à la fois
     /// pour une même vidéo, les autres jobs attendent son résultat.
-    transcribing: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    transcribing: Arc<Mutex<HashMap<String, Hub>>>,
+    /// Position de lecture de chaque vidéo, envoyée par l'interface (ms).
+    playheads: Arc<Mutex<HashMap<String, whisper::Playhead>>>,
     /// Jobs en cours : (vidéo, clé de transcription, poignée pour l'annuler).
     running: Arc<Mutex<HashMap<u64, (String, String, tokio::task::AbortHandle)>>>,
     /// Installation des modèles au premier lancement : (en cours, progression, message).
@@ -152,6 +154,7 @@ impl AppState {
             http: reqwest::Client::new(),
             setup: Arc::new(Mutex::new((false, 1.0, String::new()))),
             transcribing: Default::default(),
+            playheads: Default::default(),
             running: Default::default(),
             cache_dir,
             config_path,
@@ -310,6 +313,7 @@ pub fn router(token: String, port: u16) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/search", get(search))
         .route("/api/mix/{id}", get(mix))
+        .route("/api/playhead", post(set_playhead))
         .route("/api/stream/{id}", get(stream))
         .route("/api/media/{key}/{kind}", get(media))
         .route("/api/export", post(export_srt))
@@ -426,6 +430,14 @@ async fn create_job(State(st): State<AppState>, Json(req): Json<JobReq>) -> Resp
             });
         }
     }
+    // Idem pour les transcriptions partagées : celle d'une autre vidéo ne sert plus à rien.
+    st.transcribing.lock().unwrap().retain(|k, h| {
+        let keep = h.video == video && *k == tkey;
+        if !keep {
+            h.task.abort();
+        }
+        keep
+    });
     let id = st.next_id.fetch_add(1, Ordering::Relaxed);
     st.jobs.lock().unwrap().insert(
         id,
@@ -517,12 +529,6 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     let read_cached = || async {
         tokio::fs::read_to_string(&transcript_file).await.ok().and_then(|s| serde_json::from_str::<Transcript>(&s).ok())
     };
-    let lock = st.transcribing.lock().unwrap().entry(tkey.clone()).or_default().clone();
-    if lock.try_lock().is_err() {
-        progress(0.05, "Transcription déjà en cours pour cette vidéo — en attente…".into());
-    }
-    let _transcribing = lock.lock().await;
-    // Relu après l'attente : un autre job vient peut-être de terminer cette transcription.
     let cached: Option<Transcript> = if req.refresh { None } else { read_cached().await };
     let mut meta: Option<youtube::Meta> = None;
     let transcript = match cached {
@@ -531,22 +537,12 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
             t
         }
         None => {
-            // Avec le NMT local, chaque segment Whisper est traduit et affiché dès qu'il sort.
             let models = st.cache_dir.join("models");
             let nmt_model = st.config.lock().unwrap().nmt_model.clone();
-            let live = (req.translator == "local" && crate::nmt::is_ready(&models, &nmt_model))
-                .then(|| start_live_nmt(crate::nmt::model_dir(&models, &nmt_model), &req.source, target, publish.clone()));
-            let result = transcribe_video(st, &id, req, &work, &progress, live.as_ref().map(|(l, _)| l)).await;
-            if let Some((_, task)) = live {
-                task.abort();
-            }
-            let (t, m) = result?;
-            if let Some(dir) = transcript_file.parent() {
-                tokio::fs::create_dir_all(dir).await?;
-                tokio::fs::write(&transcript_file, serde_json::to_vec(&t)?).await?;
-            }
-            meta = Some(m);
-            t
+            let live_dir = (req.translator == "local" && crate::nmt::is_ready(&models, &nmt_model))
+                .then(|| crate::nmt::model_dir(&models, &nmt_model));
+            let rx = join_or_start_hub(st, &id, req, &tkey, work.clone());
+            follow_hub(rx, &req.source, target, live_dir, st.playhead(&id), &progress, &publish).await?
         }
     };
     let Transcript { title, is_live, source_lang, origin, mut cues } = transcript;
@@ -647,7 +643,82 @@ fn transcript_key(id: &str, req: &JobReq) -> String {
     format!("{id}_{}_{}_v{CACHE_VERSION}", req.mode, req.source)
 }
 
-#[derive(Serialize, Deserialize)]
+/// Transcription partagée d'une vidéo : lancée une seule fois, suivie par tous les jobs qui en
+/// ont besoin (changement de langue en cours de route, regénération…).
+struct Hub {
+    rx: tokio::sync::watch::Receiver<HubState>,
+    task: tokio::task::AbortHandle,
+    video: String,
+}
+
+#[derive(Default)]
+struct HubState {
+    /// Segments bruts dans l'ordre d'arrivée (pas forcément chronologique : on commence par
+    /// la zone regardée). Liste en ajout seul : un index suffit pour suivre ce qui est nouveau.
+    cues: Vec<Cue>,
+    lang: Option<String>,
+    progress: f32,
+    stage: String,
+    done: Option<std::result::Result<Arc<Transcript>, String>>,
+}
+
+impl AppState {
+    fn playhead(&self, video: &str) -> whisper::Playhead {
+        self.playheads.lock().unwrap().entry(video.to_string()).or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX))).clone()
+    }
+}
+
+/// Rejoint la transcription en cours pour cette clé, ou en lance une.
+fn join_or_start_hub(st: &AppState, id: &str, req: &JobReq, tkey: &str, work: std::path::PathBuf) -> tokio::sync::watch::Receiver<HubState> {
+    let mut hubs = st.transcribing.lock().unwrap();
+    if let Some(h) = hubs.get(tkey) {
+        if !h.task.is_finished() && (!req.refresh || h.rx.borrow().done.is_none()) {
+            return h.rx.clone();
+        }
+    }
+    let (tx, rx) = tokio::sync::watch::channel(HubState::default());
+    let tx = Arc::new(tx);
+    let (st2, id2, req2, tkey2) = (st.clone(), id.to_string(), req.clone(), tkey.to_string());
+    let task = tokio::spawn(async move {
+        let live = {
+            let (t1, t2) = (tx.clone(), tx.clone());
+            whisper::Live {
+                on_segment: Arc::new(move |c| t1.send_modify(|s| s.cues.push(c))),
+                on_language: Arc::new(move |l| {
+                    t2.send_modify(|s| {
+                        if s.lang.is_none() {
+                            s.lang = Some(l);
+                        }
+                    })
+                }),
+            }
+        };
+        let progress: Progress = {
+            let t = tx.clone();
+            Arc::new(move |f, stage| t.send_modify(|s| {
+                s.progress = f;
+                s.stage = stage;
+            }))
+        };
+        let result = transcribe_video(&st2, &id2, &req2, &work, &progress, Some(&live)).await;
+        let done = match result {
+            Ok((t, _meta)) => {
+                let file = st2.cache_dir.join("transcripts").join(format!("{tkey2}.json"));
+                if let Some(dir) = file.parent() {
+                    let _ = tokio::fs::create_dir_all(dir).await;
+                }
+                let _ = tokio::fs::write(&file, serde_json::to_vec(&t).unwrap_or_default()).await;
+                Ok(Arc::new(t))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+        tx.send_modify(|s| s.done = Some(done));
+    });
+    hubs.insert(tkey.to_string(), Hub { rx: rx.clone(), task: task.abort_handle(), video: id.to_string() });
+    rx
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Transcript {
     title: String,
     is_live: bool,
@@ -729,9 +800,9 @@ async fn whisper_pipeline(
 
     let p = progress.clone();
     let tr_progress: Progress = Arc::new(move |f, s| p(0.2 + 0.4 * f, s));
-    let (source, live, s2) = (source.to_string(), live.cloned(), stream.clone());
+    let (source, live, s2, head) = (source.to_string(), live.cloned(), stream.clone(), st.playhead(id));
     let result = tokio::task::spawn_blocking(move || {
-        whisper::transcribe_stream(&model, &s2, &source, duration, &tr_progress, live.as_ref())
+        whisper::transcribe_stream(&model, &s2, &source, duration, &tr_progress, live.as_ref(), &head)
     })
     .await;
     feeder.abort();
@@ -775,58 +846,72 @@ fn start_audio_feed(id: String, work: std::path::PathBuf, stream: Arc<whisper::P
     })
 }
 
-/// Traducteur « au fil de l'eau » : reçoit les segments de Whisper, les traduit par petits
-/// lots avec le NMT local et publie la liste à jour. La langue source est fixée par
-/// l'utilisateur ou annoncée par Whisper (« auto-detected language »).
-fn start_live_nmt(dir: std::path::PathBuf, source: &str, target: &str, publish: Publish) -> (whisper::Live, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cue>();
-    let lang = Arc::new(Mutex::new((source != "auto").then(|| source.to_string())));
-    let target = target.to_string();
-    let lang_task = lang.clone();
-    let task = tokio::spawn(async move {
-        let mut pending: Vec<Cue> = Vec::new();
-        let mut shown: Vec<Cue> = Vec::new();
-        while let Some(first) = rx.recv().await {
-            pending.push(first);
-            while let Ok(c) = rx.try_recv() {
-                pending.push(c);
-            }
-            let Some(src) = lang_task.lock().unwrap().clone() else { continue };
-            let mut batch = std::mem::take(&mut pending);
-            batch.sort_by(|a, b| a.start.total_cmp(&b.start));
-            if src == target {
-                batch.iter_mut().for_each(|c| c.text = c.orig.clone());
-            } else {
-                // Phrases entières au traducteur, puis répartition sur les cues (comme la passe finale).
-                let groups = subs::translation_groups(&batch);
-                let lines: Vec<String> = groups.iter().map(|g| subs::group_text(&batch[g.clone()])).collect();
-                let (dir, tgt) = (dir.clone(), target.clone());
-                let quiet: Progress = Arc::new(|_, _| {});
-                let Ok(Ok(texts)) = tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await
-                else {
-                    continue;
+/// Suit une transcription partagée jusqu'à sa fin. Avec le NMT local, les segments sont traduits
+/// au fil de l'eau (ceux proches de la tête de lecture d'abord) et publiés dans le job.
+async fn follow_hub(
+    mut rx: tokio::sync::watch::Receiver<HubState>,
+    source: &str,
+    target: &str,
+    live_dir: Option<std::path::PathBuf>,
+    playhead: whisper::Playhead,
+    progress: &Progress,
+    publish: &Publish,
+) -> Result<Transcript> {
+    const CHUNK: usize = 24;
+    let mut seen = 0usize;
+    let mut pending: Vec<Cue> = Vec::new();
+    let mut shown: Vec<Cue> = Vec::new();
+    loop {
+        let (new, lang, done) = {
+            let s = rx.borrow_and_update();
+            progress(0.2 + 0.4 * s.progress, s.stage.clone());
+            (s.cues[seen..].to_vec(), s.lang.clone(), s.done.clone())
+        };
+        seen += new.len();
+        if let Some(done) = done {
+            return done.map(|t| (*t).clone()).map_err(|e| anyhow!(e));
+        }
+        if let Some(dir) = &live_dir {
+            pending.extend(new);
+            let src = if source == "auto" { lang } else { Some(source.to_string()) };
+            if let (Some(src), false) = (src, pending.is_empty()) {
+                // Les segments les plus proches de ce que l'utilisateur regarde passent d'abord.
+                let head = match playhead.load(std::sync::atomic::Ordering::Relaxed) {
+                    u64::MAX => 0.0,
+                    ms => ms as f64 / 1000.0,
                 };
-                for (g, t) in groups.iter().zip(&texts) {
-                    subs::distribute(t, &mut batch[g.clone()]);
+                pending.sort_by(|a, b| (a.start - head).abs().total_cmp(&(b.start - head).abs()));
+                let take = pending.len().min(CHUNK);
+                let mut batch: Vec<Cue> = pending.drain(..take).collect();
+                batch.sort_by(|a, b| a.start.total_cmp(&b.start));
+                let base = |s: &str| s.split('-').next().unwrap_or(s).to_string();
+                if base(&src) == target {
+                    batch.iter_mut().for_each(|c| c.text = c.orig.clone());
+                } else {
+                    let groups = subs::translation_groups(&batch);
+                    let lines: Vec<String> = groups.iter().map(|g| subs::group_text(&batch[g.clone()])).collect();
+                    let (dir, src, tgt) = (dir.clone(), base(&src), target.to_string());
+                    let quiet: Progress = Arc::new(|_, _| {});
+                    if let Ok(Ok(texts)) =
+                        tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await
+                    {
+                        for (g, t) in groups.iter().zip(&texts) {
+                            subs::distribute(t, &mut batch[g.clone()]);
+                        }
+                    }
+                }
+                shown.extend(batch);
+                shown.sort_by(|a, b| a.start.total_cmp(&b.start));
+                publish(shown.clone());
+                if !pending.is_empty() {
+                    continue; // encore du travail : on ne bloque pas en attendant Whisper
                 }
             }
-            shown.extend(batch);
-            shown.sort_by(|a, b| a.start.total_cmp(&b.start));
-            publish(shown.clone());
         }
-    });
-    let live = whisper::Live {
-        on_segment: Arc::new(move |c| {
-            let _ = tx.send(c);
-        }),
-        on_language: Arc::new(move |l| {
-            let mut guard = lang.lock().unwrap();
-            if guard.is_none() {
-                *guard = Some(l);
-            }
-        }),
-    };
-    (live, task)
+        if rx.changed().await.is_err() {
+            bail!("transcription interrompue");
+        }
+    }
 }
 
 /// Associe à chaque cue traduite le texte original qui la recouvre dans le temps.
@@ -1055,6 +1140,22 @@ async fn translate_text(State(st): State<AppState>, Json(req): Json<TranslateReq
 /// Les erreurs JavaScript de la webview sont renvoyées ici pour apparaître dans le terminal.
 async fn client_log(body: String) -> StatusCode {
     eprintln!("[ui] {}", body.chars().take(2000).collect::<String>());
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct PlayheadReq {
+    video: String,
+    t: f64,
+}
+
+/// L'interface signale où en est la lecture : Whisper transcrit cette zone en priorité.
+async fn set_playhead(State(st): State<AppState>, Json(req): Json<PlayheadReq>) -> StatusCode {
+    if let Some(id) = youtube::video_id(&req.video) {
+        if req.t.is_finite() && req.t >= 0.0 {
+            st.playhead(&id).store((req.t * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     StatusCode::NO_CONTENT
 }
 

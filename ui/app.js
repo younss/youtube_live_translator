@@ -402,6 +402,7 @@ async function generate(refresh = false) {
       if (r.video_id !== state.videoId) return;
       state.result = r;
       state.cues = r.cues;
+      shownCue = -2;
       setTags();
       renderTranscript();
       setProgress(1, `${r.cues.length} SOUS-TITRES · ${r.origin} → ${r.translator}`.toUpperCase());
@@ -492,6 +493,19 @@ function applyFilter() {
 }
 $("trFilter").addEventListener("input", applyFilter);
 
+// ------------------------------------------------------------ position de lecture -> serveur
+// Whisper transcrit en priorité la zone regardée : on lui indique où en est la lecture
+// (toutes les 3 s, et tout de suite après un saut).
+let sentHead = { video: null, t: -1, at: 0 };
+function reportPlayhead(t, force = false) {
+  if (!state.videoId || !isFinite(t)) return;
+  const now = Date.now();
+  const jumped = state.videoId !== sentHead.video || Math.abs(t - sentHead.t) > 5 + (now - sentHead.at) / 1000;
+  if (!force && !jumped && now - sentHead.at < 3000) return;
+  sentHead = { video: state.videoId, t, at: now };
+  fetch("/api/playhead", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ video: state.videoId, t }) }).catch(() => {});
+}
+
 // ------------------------------------------------------------ boucle d'affichage
 function tick() {
   const p = state.player;
@@ -507,6 +521,7 @@ function tick() {
     }
     $("seekBuf").style.width = (p.getVideoLoadedFraction?.() || 0) * 100 + "%";
     renderSub(state.cues.length ? cueAt(t - state.offset) : -1);
+    reportPlayhead(t);
   }
 }
 setInterval(tick, 100);

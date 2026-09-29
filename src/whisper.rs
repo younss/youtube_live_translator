@@ -2,6 +2,7 @@
 //! fournit aucun sous-titre. Le modèle est chargé une seule fois et partagé par tous les jobs.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -155,14 +156,17 @@ pub struct PcmStream {
 
 #[derive(Default)]
 struct PcmState {
-    samples: Vec<f32>,
+    /// Stocké en 16 bits (largement suffisant pour la parole) : une vidéo de 2 h tient en
+    /// ~230 Mo au lieu de ~460 Mo en f32. Seule la fenêtre en cours est convertie en f32.
+    samples: Vec<i16>,
     done: bool,
     error: Option<String>,
 }
 
 impl PcmStream {
     pub fn push(&self, samples: &[f32]) {
-        self.state.lock().unwrap().samples.extend_from_slice(samples);
+        let quantized = samples.iter().map(|&x| (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        self.state.lock().unwrap().samples.extend(quantized);
         self.ready.notify_all();
     }
 
@@ -175,6 +179,10 @@ impl PcmStream {
 
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().samples.len()
+    }
+
+    fn is_done(&self) -> bool {
+        self.state.lock().unwrap().done
     }
 
     /// Attend qu'au moins `n` échantillons soient là (ou la fin du flux) et renvoie une copie
@@ -191,7 +199,8 @@ impl PcmStream {
         }
         let end = n.min(st.samples.len());
         let at_end = st.done && end == st.samples.len();
-        Ok((st.samples[from.min(end)..end].to_vec(), at_end))
+        let window = st.samples[from.min(end)..end].iter().map(|&x| x as f32 / i16::MAX as f32).collect();
+        Ok((window, at_end))
     }
 }
 
@@ -205,6 +214,50 @@ const WINDOW: usize = 30 * RATE;
 /// Quand une fenêtre de 30 s est surtout instrumentale (intro, pont d'une chanson), Whisper y
 /// invente du texte (filtré) et perd les paroles de la fenêtre : on la relance alors décalée
 /// de quelques secondes, ce qui suffit en général à retrouver la voix.
+/// Position de lecture (en ms) communiquée par l'interface ; `u64::MAX` = inconnue.
+pub type Playhead = Arc<AtomicU64>;
+
+/// Zones déjà transcrites, en échantillons, triées et fusionnées.
+#[derive(Default)]
+struct Covered(Vec<(usize, usize)>);
+
+impl Covered {
+    fn add(&mut self, a: usize, b: usize) {
+        if b <= a {
+            return;
+        }
+        self.0.push((a, b));
+        self.0.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.0.len());
+        for (a, b) in self.0.drain(..) {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        self.0 = merged;
+    }
+
+    /// Premier échantillon non transcrit à partir de `x`.
+    fn first_gap(&self, mut x: usize) -> usize {
+        for &(a, b) in &self.0 {
+            if x >= a && x < b {
+                x = b;
+            }
+        }
+        x
+    }
+
+    /// Début de la prochaine zone déjà faite après `x` (pour ne pas la retranscrire).
+    fn next_start(&self, x: usize) -> Option<usize> {
+        self.0.iter().map(|&(a, _)| a).find(|&a| a > x)
+    }
+
+    fn total(&self) -> usize {
+        self.0.iter().map(|(a, b)| b - a).sum()
+    }
+}
+
 pub fn transcribe_stream(
     model: &Path,
     stream: &PcmStream,
@@ -212,6 +265,7 @@ pub fn transcribe_stream(
     duration: Option<f64>,
     progress: &Progress,
     live: Option<&Live>,
+    playhead: &Playhead,
 ) -> Result<(Vec<Cue>, Option<String>)> {
     progress(0.0, "Chargement de Whisper…".into());
     let ctx = load(model)?;
@@ -232,25 +286,58 @@ pub fn transcribe_stream(
 
     let total = duration.map(|d| (d * RATE as f64) as usize);
     let mut cues: Vec<Cue> = Vec::new();
-    let mut pos = 0usize;
+    let mut covered = Covered::default();
     let mut misses = 0;
+    let mut last_pos = usize::MAX;
     loop {
-        let (pcm, at_end) = stream.wait_slice(pos, pos + WINDOW)?;
-        if pcm.len() < RATE / 2 {
+        // Priorité à ce que l'utilisateur regarde : la zone autour de la tête de lecture
+        // (3 min devant elle), puis le reste de la vidéo depuis le début.
+        let avail = stream.len();
+        let done = stream.is_done();
+        let head = match playhead.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            ms => Some((ms as usize * RATE / 1000).saturating_sub(2 * RATE)),
+        };
+        let fill = covered.first_gap(0);
+        let pos = match head.map(|h| (h, covered.first_gap(h))) {
+            // Zone de lecture pas encore faite : on y va (dès que l'audio y est arrivé,
+            // sinon on avance le remplissage en attendant).
+            Some((h, g)) if g < h + 180 * RATE && (g + RATE < avail || done || fill >= avail) => g,
+            _ => fill,
+        };
+        if done && pos >= avail {
             break;
         }
+        // Saut vers une autre zone : le compteur d'échecs repart de zéro.
+        if last_pos == usize::MAX || pos.abs_diff(last_pos) > WINDOW {
+            misses = 0;
+        }
+        last_pos = pos;
+
+        // La fenêtre s'arrête à la prochaine zone déjà transcrite.
+        let limit = covered.next_start(pos).map_or(pos + WINDOW, |n| n.min(pos + WINDOW));
+        let (pcm, at_end) = stream.wait_slice(pos, limit)?;
+        if pcm.len() < RATE / 2 {
+            // Bout d'audio trop court pour Whisper (fin de flux ou petit trou entre deux zones).
+            covered.add(pos, pos + pcm.len().max(1));
+            continue;
+        }
+        let touches_done = pos + pcm.len() >= limit && limit < pos + WINDOW;
         let base = pos as f64 / RATE as f64;
         let segs = run_pass(&ctx, &pcm, &lang, 0.0, None, None, None)?;
         let slice_end = pcm.len() as f64 / RATE as f64;
-        // Hors du dernier morceau, on garde la fin pour le morceau suivant : un segment qui
-        // touche la limite est peut-être coupé au milieu d'un mot.
+        // Hors fin de flux (ou bord d'une zone déjà faite), on garde la fin pour la fenêtre
+        // suivante : un segment qui touche la limite est peut-être coupé au milieu d'un mot.
         let keep: Vec<Cue> = segs
             .into_iter()
-            .filter(|c| at_end || c.end < slice_end - 1.0)
+            .filter(|c| at_end || touches_done || c.end < slice_end - 1.0)
             .map(|c| Cue { start: c.start + base, end: c.end + base, ..c })
             .collect();
 
-        let next = if let Some(last) = keep.last() {
+        let next = if touches_done || at_end {
+            misses = 0;
+            pos + pcm.len()
+        } else if let Some(last) = keep.last() {
             misses = 0;
             ((last.end * RATE as f64) as usize).max(pos + RATE)
         } else if misses < 8 {
@@ -261,18 +348,15 @@ pub fn transcribe_stream(
             misses = 0;
             pos + WINDOW - RATE
         };
+        covered.add(pos, next);
         for c in keep {
             if let Some(live) = live {
                 (live.on_segment)(c.clone());
             }
             cues.push(c);
         }
-        if at_end && next >= stream.len() {
-            break;
-        }
-        pos = next;
         let known = total.unwrap_or_else(|| stream.len()).max(1);
-        let pct = (pos as f32 / known as f32).min(1.0);
+        let pct = (covered.total() as f32 / known as f32).min(1.0);
         progress(pct, format!("Transcription Whisper {:.0}%", pct * 100.0));
     }
     cues.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -306,5 +390,24 @@ mod tests {
         assert!(super::is_hallucination("Sous-titres réalisés par la communauté d'Amara.org"));
         assert!(super::is_hallucination("♪"));
         assert!(!super::is_hallucination("Bonjour à tous"));
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::Covered;
+
+    #[test]
+    fn covered_merges_and_finds_gaps() {
+        let mut c = Covered::default();
+        c.add(100, 200);
+        c.add(0, 50);
+        c.add(40, 120);
+        assert_eq!(c.0, vec![(0, 200)]);
+        c.add(500, 600);
+        assert_eq!(c.first_gap(0), 200);
+        assert_eq!(c.first_gap(550), 600);
+        assert_eq!(c.next_start(250), Some(500));
+        assert_eq!(c.total(), 300);
     }
 }
