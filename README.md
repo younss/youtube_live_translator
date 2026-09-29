@@ -140,18 +140,16 @@ Changing languages regenerates the subtitles right away. **The transcript is reu
 
 | Option | Upside | Limitation |
 |---|---|---|
-| **Local NMT (hors ligne)** (default) | Offline, free, fast, private | Can't be told the speaker's gender |
+| **Local NMT (hors ligne)** (default) | Offline, free, fast, private | Guesses gender on its own, line by line |
 | **Google (gratuit)** | Good quality, no key | Can block your IP after a lot of use; the app then switches to MyMemory automatically |
 | **Claude (clé API)** | Best quality; handles context, gender and proper names | Requires an Anthropic API key (paid) |
 | **YouTube auto** | YouTube's automatic translation | Only when YouTube offers it for the video |
 
-### Get grammatical gender right (VOIX / À QUI)
+### Grammatical gender (automatic)
 
-Some languages (Arabic, French, Spanish…) mark gender, while others, like Turkish, don't. To translate correctly:
-- **VOIX**: who is speaking or singing (a woman / a man / auto).
-- **À QUI**: who is being addressed or talked about (a woman / a man / auto). For example, Arabic "you" is أنتَ for a man and أنتِ for a woman.
-
-These two settings **only affect the Claude translator**.
+Some languages (Arabic, French, Spanish…) mark gender, while others, like Turkish, don't. The app handles it **automatically**, and there's nothing to set:
+- **With Claude:** the gender of the speaker and of the person being addressed is inferred from the context: the video title (for example, the singer's name), the lyrics as a whole, and the pronouns. For example, Arabic "you" becomes أنتَ or أنتِ as appropriate.
+- **With local NMT:** the model translates line by line and chooses on its own. It isn't always right, and it can't be steered.
 
 ### Generate, regenerate, export
 
