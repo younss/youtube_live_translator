@@ -374,10 +374,13 @@ pub fn transcribe_stream(
 /// Sur la musique ou le silence, Whisper « invente » des crédits de sous-titrage
 /// appris dans ses données d'entraînement. On les retire.
 fn is_hallucination(text: &str) -> bool {
-    const PATTERNS: [&str; 14] = [
+    const PATTERNS: &[&str] = &[
         "ترجمة", "الترجمة", "اشترك", "sous-titr", "sous titr", "subtitles by", "subtitled by",
         "altyazı", "untertitel", "subtítulos", "amara.org", "thanks for watching", "merci d'avoir regardé",
         "abone ol",
+        // Crédits inventés fréquents en japonais, coréen, chinois, hindi, russe, portugais.
+        "ご視聴ありがとう", "チャンネル登録", "시청해 주셔서", "구독과 좋아요", "字幕", "请不吝点赞", "订阅",
+        "सब्सक्राइब", "субтитры", "legendas pela",
     ];
     let t = text.to_lowercase();
     t.chars().filter(|c| c.is_alphabetic()).count() < 2 || PATTERNS.iter().any(|p| t.contains(p))

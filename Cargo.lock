@@ -4786,6 +4786,7 @@ dependencies = [
  "tao",
  "tokio",
  "tokio-stream",
+ "unicode-segmentation",
  "urlencoding",
  "whisper-rs",
  "wry",

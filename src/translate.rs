@@ -9,14 +9,41 @@ use tokio::task::JoinSet;
 
 use crate::subs::Cue;
 
-pub const LANGS: [(&str, &str); 6] = [
+/// Langues proposées : (code Whisper/ISO 639-1, nom anglais pour les consignes du traducteur).
+pub const LANGS: [(&str, &str); 24] = [
     ("ar", "Arabic"),
     ("fr", "French"),
     ("en", "English"),
     ("de", "German"),
     ("tr", "Turkish"),
     ("es", "Spanish"),
+    ("pt", "Portuguese"),
+    ("it", "Italian"),
+    ("ru", "Russian"),
+    ("pl", "Polish"),
+    ("nl", "Dutch"),
+    ("fa", "Persian"),
+    ("ur", "Urdu"),
+    ("hi", "Hindi"),
+    ("bn", "Bengali"),
+    ("ta", "Tamil"),
+    ("te", "Telugu"),
+    ("zh", "Chinese (Simplified)"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("th", "Thai"),
+    ("vi", "Vietnamese"),
+    ("id", "Indonesian"),
+    ("tl", "Filipino"),
 ];
+
+/// Code attendu par Google Translate / MyMemory quand il diffère du nôtre.
+pub fn google_code(code: &str) -> &str {
+    match code {
+        "zh" => "zh-CN",
+        c => c,
+    }
+}
 
 pub fn lang_name(code: &str) -> &str {
     LANGS.iter().find(|(c, _)| *c == code).map(|(_, n)| *n).unwrap_or(code)
@@ -190,7 +217,8 @@ async fn google_batch(http: &reqwest::Client, lines: &[String], source: &str, ta
 }
 
 async fn google_one(http: &reqwest::Client, text: &str, source: &str, target: &str) -> Result<String> {
-    let sl = if source.is_empty() { "auto" } else { source };
+    let sl = if source.is_empty() { "auto" } else { google_code(source) };
+    let target = google_code(target);
     let resp = http
         .post("https://translate.googleapis.com/translate_a/single")
         .query(&[("client", "gtx"), ("sl", sl), ("tl", target), ("dt", "t")])
@@ -217,7 +245,7 @@ async fn mymemory_batch(http: &reqwest::Client, lines: &[String], source: &str, 
         let q: String = line.chars().take(450).collect();
         let v: Value = http
             .get("https://api.mymemory.translated.net/get")
-            .query(&[("q", q.as_str()), ("langpair", &format!("{source}|{target}"))])
+            .query(&[("q", q.as_str()), ("langpair", &format!("{}|{}", google_code(source), google_code(target)))])
             .send()
             .await
             .context("MyMemory injoignable")?

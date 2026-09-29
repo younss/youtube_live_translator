@@ -547,7 +547,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     };
     let Transcript { title, is_live, source_lang, origin, mut cues } = transcript;
 
-    let base = |s: &str| s.split('-').next().unwrap_or(s).to_string();
+    let base = |s: &str| youtube::normalize_lang(s);
     let needs_translation = base(&source_lang) != target;
     let mut translator = "aucun (même langue)".to_string();
     if needs_translation {
@@ -558,9 +558,10 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                     Some(m) => m,
                     None => youtube::metadata(&id).await?,
                 };
-                let track = youtube::Track { key: target.to_string(), lang: target.to_string(), auto: true };
-                let manual = meta.subtitles.contains_key(target);
-                if !manual && !meta.automatic_captions.contains_key(target) {
+                let key = youtube::youtube_key(target);
+                let track = youtube::Track { key: key.to_string(), lang: target.to_string(), auto: true };
+                let manual = meta.subtitles.contains_key(key);
+                if !manual && !meta.automatic_captions.contains_key(key) {
                     bail!("YouTube ne propose pas de traduction automatique vers « {target} » pour cette vidéo");
                 }
                 let track = youtube::Track { auto: !manual, ..track };
@@ -884,7 +885,7 @@ async fn follow_hub(
                 let take = pending.len().min(CHUNK);
                 let mut batch: Vec<Cue> = pending.drain(..take).collect();
                 batch.sort_by(|a, b| a.start.total_cmp(&b.start));
-                let base = |s: &str| s.split('-').next().unwrap_or(s).to_string();
+                let base = |s: &str| youtube::normalize_lang(s);
                 if base(&src) == target {
                     batch.iter_mut().for_each(|c| c.text = c.orig.clone());
                 } else {

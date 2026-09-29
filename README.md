@@ -1,6 +1,16 @@
 # YouTube Live Translator
 
-A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It plays a YouTube video from its URL and shows **generated and translated subtitles**, from and to **Arabic, French, English, German, Turkish and Spanish**.
+A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It plays a YouTube video from its URL and shows **generated and translated subtitles**, from and to **24 languages**.
+
+**Supported languages:**
+
+| Group | Languages |
+|---|---|
+| Europe | French, English, German, Spanish, Portuguese, Italian, Russian, Polish, Dutch, Turkish |
+| Middle East and South Asia | Arabic, Persian, Urdu, Hindi, Bengali, Tamil, Telugu |
+| East and Southeast Asia | Chinese (simplified), Japanese, Korean, Thai, Vietnamese, Indonesian, Filipino |
+
+Every language works as a source (spoken in the video) and as a target (for the subtitles), in any combination. They cover the big film and series industries: K-dramas, anime, Bollywood and Kollywood, Chinese and Thai dramas, telenovelas, Turkish and Persian series.
 
 Everything runs **locally on your Mac**:
 - **Transcription:** Whisper, compiled into the app.
@@ -36,7 +46,7 @@ Everything runs **locally on your Mac**:
 - **Subtitles**, from one of two sources:
   - YouTube's own subtitles, manual or automatic;
   - a **local transcription with Whisper**, which also works on songs.
-- **Offline translation** between 6 languages with NLLB-200. Google, Claude and YouTube's automatic translation are also available.
+- **Offline translation** between 24 languages with NLLB-200. Google, Claude and YouTube's automatic translation are also available.
 - **Progressive display:** subtitles appear as they're transcribed and translated, about 7 s after you open a video.
 - **Two-line mode:** the original text and its translation, one above the other.
 - **Clickable transcript**, with a search filter.
@@ -316,6 +326,10 @@ YouTube URL
 | Transcription | `whisper-rs` (whisper.cpp, compiled in, Metal acceleration) |
 | Offline translation | `ct2rs` (CTranslate2, compiled in) + NLLB-200 int8 |
 | Interface | HTML/CSS/JS embedded in the binary (`rust-embed`) |
+
+**Writing systems:**
+- Chinese, Japanese and Thai have no spaces between words. The translation is spread across lines by characters (graphemes, so Thai vowel signs stay attached), and CJK characters count as double width for line length.
+- Sentence-ending punctuation is recognized for each script: `。！？` (CJK), `।` (Hindi), `۔` (Urdu), `؟` (Arabic/Persian).
 
 **Sync and context:**
 - Subtitles are kept short: Whisper cuts between words (about 70 characters at most), and short lines are merged only up to about 5 s / 84 characters. A single phrase sung slowly can last longer, because the line follows the voice.

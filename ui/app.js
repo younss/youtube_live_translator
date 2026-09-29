@@ -2,7 +2,14 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const LANG_NAMES = { ar: "العربية — Arabe", fr: "Français", en: "English — Anglais", de: "Deutsch — Allemand", tr: "Türkçe — Turc", es: "Español — Espagnol" };
+const LANG_NAMES = {
+  ar: "العربية — Arabe", fr: "Français", en: "English — Anglais", de: "Deutsch — Allemand",
+  tr: "Türkçe — Turc", es: "Español — Espagnol", pt: "Português — Portugais", it: "Italiano — Italien",
+  ru: "Русский — Russe", pl: "Polski — Polonais", nl: "Nederlands — Néerlandais", fa: "فارسی — Persan",
+  ur: "اردو — Ourdou", hi: "हिन्दी — Hindi", bn: "বাংলা — Bengali", ta: "தமிழ் — Tamoul",
+  te: "తెలుగు — Télougou", zh: "中文 — Chinois", ja: "日本語 — Japonais", ko: "한국어 — Coréen",
+  th: "ไทย — Thaï", vi: "Tiếng Việt — Vietnamien", id: "Bahasa Indonesia — Indonésien", tl: "Filipino — Philippin",
+};
 
 // ------------------------------------------------------------ stockage local
 const store = {

@@ -34,6 +34,24 @@ fn nllb_code(lang: &str) -> Option<&'static str> {
         "de" => "deu_Latn",
         "tr" => "tur_Latn",
         "es" => "spa_Latn",
+        "pt" => "por_Latn",
+        "it" => "ita_Latn",
+        "ru" => "rus_Cyrl",
+        "pl" => "pol_Latn",
+        "nl" => "nld_Latn",
+        "fa" => "pes_Arab",
+        "ur" => "urd_Arab",
+        "hi" => "hin_Deva",
+        "bn" => "ben_Beng",
+        "ta" => "tam_Taml",
+        "te" => "tel_Telu",
+        "zh" => "zho_Hans",
+        "ja" => "jpn_Jpan",
+        "ko" => "kor_Hang",
+        "th" => "tha_Thai",
+        "vi" => "vie_Latn",
+        "id" => "ind_Latn",
+        "tl" => "tgl_Latn",
         _ => return None,
     })
 }
@@ -73,6 +91,19 @@ pub async fn ensure_model(models_dir: &Path, name: &str, progress: &Progress) ->
         tokio::fs::rename(&tmp, &path).await?;
     }
     Ok(dir)
+}
+
+/// NLLB termine souvent les phrases japonaises et chinoises par un point latin : on remet la
+/// ponctuation pleine chasse attendue.
+fn fix_punctuation(text: &str, target: &str) -> String {
+    if !matches!(target, "ja" | "zh") {
+        return text.to_string();
+    }
+    let t = text.trim_end();
+    match t.strip_suffix('.').or_else(|| t.strip_suffix("...")) {
+        Some(rest) if !rest.ends_with('.') => format!("{rest}。"),
+        _ => t.replace("?", "？").replace("!", "！"),
+    }
 }
 
 /// Tokeniseur NLLB : `<langue source> pièces… </s>` en entrée ; à la sortie on retire
@@ -176,10 +207,19 @@ pub fn translate_blocking(
         if res.len() != chunk.len() {
             bail!("le moteur a renvoyé {} lignes au lieu de {}", res.len(), chunk.len());
         }
-        out.extend(res.into_iter().map(|(text, _)| text.trim().to_string()));
+        out.extend(res.into_iter().map(|(text, _)| fix_punctuation(text.trim(), target)));
         on_chunk(&out);
         progress((i + 1) as f32 / chunks.len() as f32, format!("Traduction locale {}/{}", i + 1, chunks.len()));
     }
     *LAST_USE.lock().unwrap() = Some(std::time::Instant::now());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cjk_final_period() {
+        assert_eq!(super::fix_punctuation("明天我会在车站等你.", "zh"), "明天我会在车站等你。");
+        assert_eq!(super::fix_punctuation("Hello.", "fr"), "Hello.");
+    }
 }

@@ -95,6 +95,25 @@ pub fn watch_url(id: &str) -> String {
     format!("https://www.youtube.com/watch?v={id}")
 }
 
+/// Ramène un code de langue YouTube (« zh-Hans », « pt-BR », « fil »…) à notre code court.
+pub fn normalize_lang(code: &str) -> String {
+    let base = code.split(['-', '_']).next().unwrap_or(code).to_lowercase();
+    match base.as_str() {
+        "fil" => "tl".into(),
+        "iw" => "he".into(),
+        _ => base,
+    }
+}
+
+/// Clé de piste YouTube pour une langue cible (traduction automatique de YouTube).
+pub fn youtube_key(code: &str) -> &str {
+    match code {
+        "zh" => "zh-Hans",
+        "tl" => "fil",
+        c => c,
+    }
+}
+
 /// Piste YouTube choisie : clé de langue + manuelle ou automatique.
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -105,7 +124,7 @@ pub struct Track {
 
 /// Choisit la meilleure piste dans la langue source (ou la langue de la vidéo si "auto").
 pub fn pick_source_track(meta: &Meta, source: &str) -> Option<Track> {
-    let base = |k: &str| k.split(['-', '_']).next().unwrap_or(k).to_lowercase();
+    let base = |k: &str| normalize_lang(k);
     let wanted: Option<String> = match source {
         "auto" => meta.language.as_deref().map(base),
         s => Some(s.to_string()),

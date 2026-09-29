@@ -143,7 +143,35 @@ fn clip_overlaps(cues: &mut [Cue]) {
 }
 
 fn ends_sentence(text: &str) -> bool {
-    text.trim_end().ends_with(['.', '!', '?', '…', '؟', '。'])
+    // Latin, arabe/persan/ourdou (؟ ۔), CJK pleine chasse (。！？｡), devanagari (। ॥).
+    text.trim_end().ends_with(['.', '!', '?', '…', '؟', '۔', '。', '！', '？', '｡', '।', '॥'])
+}
+
+/// Largeur d'affichage approximative : un idéogramme CJK / un caractère coréen ou japonais
+/// pleine chasse occupe la place de deux lettres latines.
+pub fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F | 0x2E80..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFF00..=0xFF60 => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Découpe une traduction en unités à répartir sur plusieurs lignes : des mots pour les
+/// écritures avec espaces, des graphèmes pour le chinois, le japonais et le thaï (qui n'en
+/// ont pas ; les graphèmes gardent les voyelles et tons thaïs attachés à leur consonne).
+fn units(text: &str) -> (Vec<String>, &'static str) {
+    use unicode_segmentation::UnicodeSegmentation;
+    // Écritures sans espaces entre les mots : chinois, japonais (kana), thaï, lao, khmer, birman.
+    let unspaced = |c: char| {
+        matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0x0E00..=0x0EFF | 0x1780..=0x17FF | 0x1000..=0x109F)
+    };
+    let total = text.chars().filter(|c| !c.is_whitespace()).count().max(1);
+    if text.chars().filter(|&c| unspaced(c)).count() * 2 < total {
+        return (text.split_whitespace().map(String::from).collect(), " ");
+    }
+    (text.graphemes(true).filter(|g| !g.trim().is_empty()).map(String::from).collect(), "")
 }
 
 /// Regroupe les fragments très courts (auto-captions mot à mot) en lignes lisibles.
@@ -155,7 +183,7 @@ pub fn merge_short(cues: Vec<Cue>) -> Vec<Cue> {
     let mut out: Vec<Cue> = Vec::new();
     for cue in cues {
         if let Some(last) = out.last_mut() {
-            let fits = last.orig.chars().count() + cue.orig.chars().count() < MAX_CHARS
+            let fits = display_width(&last.orig) + display_width(&cue.orig) < MAX_CHARS
                 && cue.end - last.start <= MAX_SECS
                 && cue.start - last.end < 1.0;
             if fits && !ends_sentence(&last.orig) {
@@ -181,7 +209,7 @@ pub fn translation_groups(cues: &[Cue]) -> Vec<std::ops::Range<usize>> {
     let mut start = 0;
     let mut chars = 0;
     for (i, c) in cues.iter().enumerate() {
-        let n = c.orig.chars().count();
+        let n = display_width(&c.orig);
         if i > start {
             let prev = &cues[i - 1];
             let split = ends_sentence(&prev.orig)
@@ -212,16 +240,16 @@ pub fn group_text(cues: &[Cue]) -> String {
 /// correspondante est prononcée, au lieu d'afficher toute la phrase d'avance.
 pub fn distribute(translation: &str, cues: &mut [Cue]) {
     let translation = translation.trim();
-    let words: Vec<&str> = translation.split_whitespace().collect();
+    let (words, sep) = units(translation);
     if cues.len() <= 1 || words.len() < cues.len() {
         for c in cues.iter_mut() {
             c.text = translation.to_string();
         }
         return;
     }
-    let weights: Vec<f64> = cues.iter().map(|c| c.orig.chars().count().max(1) as f64).collect();
+    let weights: Vec<f64> = cues.iter().map(|c| display_width(&c.orig).max(1) as f64).collect();
     let total_w: f64 = weights.iter().sum();
-    let lens: Vec<usize> = words.iter().map(|w| w.chars().count() + 1).collect();
+    let lens: Vec<usize> = words.iter().map(|w| display_width(w) + sep.len()).collect();
     let total_len = lens.iter().sum::<usize>() as f64;
     let (mut from, mut len, mut acc_w) = (0usize, 0usize, 0.0);
     let last = cues.len() - 1;
@@ -241,7 +269,7 @@ pub fn distribute(translation: &str, cues: &mut [Cue]) {
             }
             to
         };
-        cue.text = words[from..to].join(" ");
+        cue.text = words[from..to].join(sep);
         from = to;
     }
 }
@@ -312,5 +340,41 @@ mod tests {
     fn srt_timestamps() {
         let srt = to_srt(&[Cue::new(3661.5, 3662.25, "x".into())], |c| &c.text);
         assert!(srt.contains("01:01:01,500 --> 01:01:02,250"));
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    fn cue(s: f64, e: f64, t: &str) -> Cue {
+        Cue { start: s, end: e, text: t.into(), orig: t.into() }
+    }
+
+    #[test]
+    fn distributes_cjk_without_spaces() {
+        let mut cues = vec![cue(0.0, 1.0, "hello there"), cue(1.0, 2.0, "my friend")];
+        distribute("こんにちは友達", &mut cues);
+        assert!(!cues[0].text.is_empty() && !cues[1].text.is_empty());
+        assert_eq!(format!("{}{}", cues[0].text, cues[1].text), "こんにちは友達");
+    }
+
+    #[test]
+    fn thai_keeps_combining_marks_attached() {
+        let mut cues = vec![cue(0.0, 1.0, "aaaa"), cue(1.0, 2.0, "bbbb")];
+        distribute("สวัสดีครับ", &mut cues);
+        assert_eq!(format!("{}{}", cues[0].text, cues[1].text), "สวัสดีครับ");
+        // Aucune ligne ne commence par une voyelle ou un ton isolé (U+0E31, U+0E34..U+0E3A, U+0E47..U+0E4E).
+        for c in &cues {
+            let first = c.text.chars().next().unwrap() as u32;
+            assert!(!(first == 0x0E31 || (0x0E34..=0x0E3A).contains(&first) || (0x0E47..=0x0E4E).contains(&first)));
+        }
+    }
+
+    #[test]
+    fn width_and_sentence_ends() {
+        assert_eq!(display_width("ab"), 2);
+        assert_eq!(display_width("日本"), 4);
+        assert!(ends_sentence("ありがとう。") && ends_sentence("क्या हाल है।") && ends_sentence("好吗？"));
     }
 }
