@@ -317,6 +317,11 @@ YouTube URL
 | Offline translation | `ct2rs` (CTranslate2, compiled in) + NLLB-200 int8 |
 | Interface | HTML/CSS/JS embedded in the binary (`rust-embed`) |
 
+**Sync and context:**
+- Subtitles are kept short: Whisper cuts between words (about 70 characters at most), and short lines are merged only up to about 5 s / 84 characters. A single phrase sung slowly can last longer, because the line follows the voice.
+- Word-level timestamps make each line appear when it's spoken, not during the silence before it. A corrupted audio frame is replaced with silence of the same length, so the timeline doesn't shift.
+- For translation, lines are regrouped into whole sentences (split on punctuation and pauses) and translated with that context. The translation is then spread back over the lines of the sentence.
+
 **Memory:**
 - Whisper is freed at the end of each transcription.
 - The NMT is freed after 1 minute idle.
