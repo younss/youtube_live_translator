@@ -12,6 +12,8 @@ use symphonia::core::packet::Packet;
 use symphonia::core::units::{Duration, Timestamp};
 
 const OUT_RATE: f64 = 16_000.0;
+/// Échantillons (par canal) d'une trame AAC-LC.
+const AAC_FRAME: usize = 1024;
 const SAMPLE_RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
 /// Décodeur AAC/ADTS à état : accepte les segments dans l'ordre et renvoie du PCM 16 kHz mono.
@@ -66,7 +68,12 @@ impl AdtsDecoder {
             self.frames += 1;
             let buf = match decoder.decode(&packet) {
                 Ok(buf) => buf,
-                Err(_) => continue, // trame corrompue : on passe à la suivante
+                Err(_) => {
+                    // Trame corrompue : on la remplace par du silence de même durée. La sauter
+                    // raccourcirait l'audio et décalerait tous les sous-titres suivants.
+                    mono.extend(std::iter::repeat_n(0.0, AAC_FRAME));
+                    continue;
+                }
             };
             let channels = buf.spec().channels().count().max(1);
             self.scratch.clear();
@@ -223,7 +230,10 @@ fn decode_container(data: Vec<u8>) -> Result<Vec<f32>> {
         if packet.track_id != track_id {
             continue;
         }
-        let Ok(buf) = decoder.decode(&packet) else { continue };
+        let Ok(buf) = decoder.decode(&packet) else {
+            out.extend(resampler.process(&[0.0; AAC_FRAME])); // garde la chronologie (voir `feed`)
+            continue;
+        };
         let channels = buf.spec().channels().count().max(1);
         scratch.clear();
         buf.copy_to_vec_interleaved::<f32>(&mut scratch);

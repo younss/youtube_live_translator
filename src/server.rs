@@ -496,7 +496,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     }
     let work = st.cache_dir.join("work");
     let cache_file = st.cache_dir.join("subs").join(format!(
-        "{id}_{}_{}_{}_{}_{}_{}{}.json",
+        "{id}_{}_{}_{}_{}_{}_{}{}_v{CACHE_VERSION}.json",
         req.mode, req.source, target, req.translator, req.voice, req.addressee,
         if req.translator == "local" { format!("_{}", st.config.lock().unwrap().nmt_model) } else { String::new() }
     ));
@@ -579,22 +579,30 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                 let dir = crate::nmt::ensure_model(&st.cache_dir.join("models"), &nmt_model, &dl).await?;
                 let p = progress.clone();
                 let sub: Progress = Arc::new(move |f, s| p(0.7 + 0.29 * f, s));
-                let lines: Vec<String> = cues.iter().map(|c| c.orig.clone()).collect();
+                // NLLB traduit phrase par phrase : on lui donne des phrases entières, pas des
+                // morceaux de sous-titre, puis on répartit la traduction sur les cues.
+                let groups = subs::translation_groups(&cues);
+                let lines: Vec<String> = groups.iter().map(|g| subs::group_text(&cues[g.clone()])).collect();
                 let (src, tgt) = (base(&source_lang), target.to_string());
                 let snapshot = cues.clone();
                 let publish = publish.clone();
+                let groups2 = groups.clone();
                 let out = tokio::task::spawn_blocking(move || {
                     // Chaque lot traduit est publié tout de suite : l'affichage commence en ~1 s.
                     let on_chunk = |done: &[String]| {
-                        let ready: Vec<Cue> =
-                            snapshot.iter().zip(done).map(|(c, t)| Cue { text: t.clone(), ..c.clone() }).collect();
+                        let mut ready = snapshot.clone();
+                        for (g, t) in groups2.iter().zip(done) {
+                            subs::distribute(t, &mut ready[g.clone()]);
+                        }
+                        let translated = done.len().checked_sub(1).and_then(|i| groups2.get(i)).map_or(0, |g| g.end);
+                        ready.truncate(translated);
                         publish(ready);
                     };
                     crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &sub, &on_chunk)
                 })
                 .await??;
-                for (c, t) in cues.iter_mut().zip(out) {
-                    c.text = t;
+                for (g, t) in groups.iter().zip(&out) {
+                    subs::distribute(t, &mut cues[g.clone()]);
                 }
                 translator = format!("NMT local (NLLB {nmt_model})");
             }
@@ -632,8 +640,11 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     Ok(result)
 }
 
+/// À incrémenter quand le découpage des cues change : les caches écrits avant sont ignorés.
+const CACHE_VERSION: u32 = 2;
+
 fn transcript_key(id: &str, req: &JobReq) -> String {
-    format!("{id}_{}_{}", req.mode, req.source)
+    format!("{id}_{}_{}_v{CACHE_VERSION}", req.mode, req.source)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -781,18 +792,25 @@ fn start_live_nmt(dir: std::path::PathBuf, source: &str, target: &str, publish: 
                 pending.push(c);
             }
             let Some(src) = lang_task.lock().unwrap().clone() else { continue };
-            let batch = std::mem::take(&mut pending);
-            let texts: Vec<String> = if src == target {
-                batch.iter().map(|c| c.orig.clone()).collect()
+            let mut batch = std::mem::take(&mut pending);
+            batch.sort_by(|a, b| a.start.total_cmp(&b.start));
+            if src == target {
+                batch.iter_mut().for_each(|c| c.text = c.orig.clone());
             } else {
-                let (dir, lines, tgt) = (dir.clone(), batch.iter().map(|c| c.orig.clone()).collect::<Vec<_>>(), target.clone());
+                // Phrases entières au traducteur, puis répartition sur les cues (comme la passe finale).
+                let groups = subs::translation_groups(&batch);
+                let lines: Vec<String> = groups.iter().map(|g| subs::group_text(&batch[g.clone()])).collect();
+                let (dir, tgt) = (dir.clone(), target.clone());
                 let quiet: Progress = Arc::new(|_, _| {});
-                match tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await {
-                    Ok(Ok(t)) => t,
-                    _ => continue,
+                let Ok(Ok(texts)) = tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await
+                else {
+                    continue;
+                };
+                for (g, t) in groups.iter().zip(&texts) {
+                    subs::distribute(t, &mut batch[g.clone()]);
                 }
-            };
-            shown.extend(batch.into_iter().zip(texts).map(|(c, t)| Cue { text: t, ..c }));
+            }
+            shown.extend(batch);
             shown.sort_by(|a, b| a.start.total_cmp(&b.start));
             publish(shown.clone());
         }

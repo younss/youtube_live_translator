@@ -142,19 +142,23 @@ fn clip_overlaps(cues: &mut [Cue]) {
     }
 }
 
-/// Regroupe les fragments courts (auto-captions mot à mot) en phrases lisibles,
-/// ce qui donne aussi une bien meilleure traduction.
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end().ends_with(['.', '!', '?', '…', '؟', '。'])
+}
+
+/// Regroupe les fragments très courts (auto-captions mot à mot) en lignes lisibles.
+/// Les lignes restent courtes (~2 lignes à l'écran, ≤ 5 s) pour rester calées sur la voix :
+/// le contexte nécessaire à la traduction est reconstitué à part, par [`translation_groups`].
 pub fn merge_short(cues: Vec<Cue>) -> Vec<Cue> {
-    const MAX_CHARS: usize = 110;
-    const MAX_SECS: f64 = 7.0;
+    const MAX_CHARS: usize = 84;
+    const MAX_SECS: f64 = 5.0;
     let mut out: Vec<Cue> = Vec::new();
     for cue in cues {
         if let Some(last) = out.last_mut() {
-            let ends_sentence = last.orig.trim_end().ends_with(['.', '!', '?', '…', '؟', '。']);
             let fits = last.orig.chars().count() + cue.orig.chars().count() < MAX_CHARS
                 && cue.end - last.start <= MAX_SECS
                 && cue.start - last.end < 1.0;
-            if fits && !ends_sentence {
+            if fits && !ends_sentence(&last.orig) {
                 last.orig = format!("{} {}", last.orig, cue.orig);
                 last.text = last.orig.clone();
                 last.end = cue.end;
@@ -164,6 +168,82 @@ pub fn merge_short(cues: Vec<Cue>) -> Vec<Cue> {
         out.push(cue);
     }
     out
+}
+
+/// Découpe les cues en unités de traduction : des phrases entières quand la ponctuation le
+/// permet, sinon des blocs bornés par les pauses de la voix. Traduire une ligne isolée (souvent
+/// une moitié de phrase) donne des contresens ; traduire la phrase entière, beaucoup moins.
+pub fn translation_groups(cues: &[Cue]) -> Vec<std::ops::Range<usize>> {
+    const MAX_CHARS: usize = 160;
+    const MAX_SECS: f64 = 10.0;
+    const PAUSE: f64 = 1.2;
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut chars = 0;
+    for (i, c) in cues.iter().enumerate() {
+        let n = c.orig.chars().count();
+        if i > start {
+            let prev = &cues[i - 1];
+            let split = ends_sentence(&prev.orig)
+                || c.start - prev.end > PAUSE
+                || chars + n > MAX_CHARS
+                || c.end - cues[start].start > MAX_SECS;
+            if split {
+                groups.push(start..i);
+                start = i;
+                chars = 0;
+            }
+        }
+        chars += n + 1;
+    }
+    if start < cues.len() {
+        groups.push(start..cues.len());
+    }
+    groups
+}
+
+/// Texte source d'un groupe, sur une seule ligne.
+pub fn group_text(cues: &[Cue]) -> String {
+    cues.iter().map(|c| c.orig.trim()).collect::<Vec<_>>().join(" ").replace('\n', " ")
+}
+
+/// Répartit la traduction d'un groupe sur ses cues, au prorata de la longueur du texte source
+/// de chacune (coupure entre deux mots) : chaque morceau s'affiche pendant que la phrase
+/// correspondante est prononcée, au lieu d'afficher toute la phrase d'avance.
+pub fn distribute(translation: &str, cues: &mut [Cue]) {
+    let translation = translation.trim();
+    let words: Vec<&str> = translation.split_whitespace().collect();
+    if cues.len() <= 1 || words.len() < cues.len() {
+        for c in cues.iter_mut() {
+            c.text = translation.to_string();
+        }
+        return;
+    }
+    let weights: Vec<f64> = cues.iter().map(|c| c.orig.chars().count().max(1) as f64).collect();
+    let total_w: f64 = weights.iter().sum();
+    let lens: Vec<usize> = words.iter().map(|w| w.chars().count() + 1).collect();
+    let total_len = lens.iter().sum::<usize>() as f64;
+    let (mut from, mut len, mut acc_w) = (0usize, 0usize, 0.0);
+    let last = cues.len() - 1;
+    for (i, cue) in cues.iter_mut().enumerate() {
+        let to = if i == last {
+            words.len()
+        } else {
+            acc_w += weights[i];
+            let target = acc_w / total_w * total_len;
+            // Au moins un mot par cue, et un mot au moins pour chacune des suivantes.
+            let max_to = words.len() - (last - i);
+            let mut to = from + 1;
+            len += lens[from];
+            while to < max_to && ((len + lens[to]) as f64 - target).abs() <= (len as f64 - target).abs() {
+                len += lens[to];
+                to += 1;
+            }
+            to
+        };
+        cue.text = words[from..to].join(" ");
+        from = to;
+    }
 }
 
 pub fn to_srt(cues: &[Cue], field: impl Fn(&Cue) -> &str) -> String {
@@ -203,6 +283,29 @@ mod tests {
         let merged = merge_short(cues);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].orig, "Bonjour à tous.");
+    }
+
+    #[test]
+    fn groups_follow_sentences_and_pauses() {
+        let cues = vec![
+            Cue::new(0.0, 1.0, "I don't know".into()),
+            Cue::new(1.0, 2.0, "why you left.".into()),
+            Cue::new(2.1, 3.0, "Come back".into()),
+            Cue::new(5.0, 6.0, "tomorrow".into()),
+        ];
+        assert_eq!(translation_groups(&cues), [0..2, 2..3, 3..4]);
+        assert_eq!(group_text(&cues[0..2]), "I don't know why you left.");
+    }
+
+    #[test]
+    fn distribute_splits_by_source_length() {
+        let mut cues = vec![Cue::new(0.0, 1.0, "I don't know".into()), Cue::new(1.0, 2.0, "why you left me here.".into())];
+        distribute("Je ne sais pas pourquoi tu m'as laissé ici.", &mut cues);
+        assert_eq!(cues[0].text, "Je ne sais pas");
+        assert_eq!(cues[1].text, "pourquoi tu m'as laissé ici.");
+        // Traduction trop courte pour être répartie : chaque cue reçoit tout.
+        distribute("Non.", &mut cues);
+        assert!(cues.iter().all(|c| c.text == "Non."));
     }
 
     #[test]

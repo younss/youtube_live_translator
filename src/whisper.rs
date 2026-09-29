@@ -110,6 +110,12 @@ fn run_pass(
     // suppress_nst retire les « ♪ » et autres jetons non verbaux.
     params.set_n_max_text_ctx(0);
     params.set_suppress_nst(true);
+    // Horodatage par jeton et segments courts coupés entre deux mots : sans cela un segment
+    // peut couvrir 10 s de parole (et commencer pendant le silence qui précède), et le
+    // sous-titre apparaît bien avant la voix. `max_len` est en octets UTF-8.
+    params.set_token_timestamps(true);
+    params.set_split_on_word(true);
+    params.set_max_len(70);
     params.set_offset_ms((offset * 1000.0) as i32);
     params.set_duration_ms(duration.map_or(0, |d| (d * 1000.0) as i32));
     silence(&mut params);

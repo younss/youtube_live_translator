@@ -41,7 +41,6 @@ pub struct TranslationContext {
 }
 
 /// Traduit `cue.orig` vers `target` et remplit `cue.text`.
-/// Traduit `cue.orig` vers `target` et remplit `cue.text`.
 /// Renvoie le nom du service réellement utilisé (Google peut basculer sur MyMemory).
 pub async fn translate_cues(
     cues: &mut [Cue],
@@ -63,7 +62,23 @@ pub async fn translate_cues(
             translate_claude(cues, source, target, &http, key, context, progress).await?;
             Ok("Claude".into())
         }
-        Engine::Google => translate_free(cues, source, target, &http, progress).await,
+        Engine::Google => {
+            // Google traduit ligne à ligne sans contexte : on lui envoie des phrases entières,
+            // puis on répartit chaque traduction sur les cues de sa phrase.
+            let groups = crate::subs::translation_groups(cues);
+            let mut units: Vec<Cue> = groups
+                .iter()
+                .map(|g| {
+                    let text = crate::subs::group_text(&cues[g.clone()]);
+                    Cue { start: cues[g.start].start, end: cues[g.end - 1].end, orig: text.clone(), text }
+                })
+                .collect();
+            let who = translate_free(&mut units, source, target, &http, progress).await?;
+            for (g, unit) in groups.iter().zip(&units) {
+                crate::subs::distribute(&unit.text, &mut cues[g.clone()]);
+            }
+            Ok(who)
+        }
     }
 }
 
@@ -254,6 +269,9 @@ async fn claude_batch(
          lyrics, so use the surrounding lines as context. {voice} {addressee} \
          Never translate proper names (people, places, brands, song titles): keep them as they are, or transliterate \
          them phonetically when the target language uses another script (e.g. Arabic). \
+         Lines are often fragments of one sentence split across several subtitles: translate the whole sentence \
+         with its meaning, then cut your translation at the same places so each line matches what is being said \
+         on screen at that moment. \
          Return exactly one translation per input line, in the same order, keeping each line short and natural \
          for on-screen reading. Never merge, split, skip or add lines.",
         to = lang_name(target),
@@ -265,7 +283,7 @@ async fn claude_batch(
         "fallbacks": "default",
         "system": system,
         "output_config": {
-            "effort": "low",
+            "effort": "medium",
             "format": {
                 "type": "json_schema",
                 "schema": {
