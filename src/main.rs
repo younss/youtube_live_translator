@@ -1181,7 +1181,16 @@ fn main() -> Result<()> {
     });
 
     ui.run()?;
-    let _ = mpv.command("quit", &[]);
-    drop(rt);
-    Ok(())
+    // Fermeture immédiate : attendre la fin d'un Whisper en cours (GPU) ou l'arrêt de mpv
+    // (qui attend la libération de son contexte de rendu) figeait l'app plusieurs dizaines de
+    // secondes. Les préférences et la playlist sont déjà enregistrées à chaque changement.
+    let _ = ui.hide();
+    save_prefs(&ui);
+    let _ = mpv.command("stop", &[]);
+    rt.shutdown_background();
+    // _exit : pas de destructeurs C++ (ggml/Metal, CTranslate2) sur des travaux interrompus.
+    unsafe extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
