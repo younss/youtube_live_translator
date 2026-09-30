@@ -1,0 +1,960 @@
+// Interface « VLC × Winamp » — métal sombre, écran LCD vert, accent orange.
+// La vidéo est dessinée par mpv SOUS l'interface (OpenGL) : la zone `stage` reste transparente.
+
+import { LineEdit, ListView, AboutSlint } from "std-widgets.slint";
+
+export struct PlItem { title: string, sel: bool, playing: bool }
+export struct ResItem { title: string, channel: string, duration: string }
+export struct TrItem { time: string, text: string, orig: string, now: bool }
+
+global Theme {
+    out property <color> bg: #16171b;
+    out property <color> metal-1: #3a3d45;
+    out property <color> metal-2: #24262c;
+    out property <color> edge-hi: #5b5f6b;
+    out property <color> edge-lo: #0b0c0e;
+    out property <color> text: #d9dce3;
+    out property <color> muted: #8a8f9c;
+    out property <color> accent: #ff8a1f;
+    out property <color> accent-dim: #b35a0b;
+    out property <color> lcd: #3dff8a;
+    out property <color> lcd-dim: #135c32;
+    out property <color> lcd-bg: #050806;
+    out property <color> danger: #ff5a4f;
+    out property <color> warn: #ffd23d;
+    out property <color> title-1: #2c3f7a;
+    out property <color> title-2: #131c42;
+    out property <string> mono: "Menlo";
+}
+
+// ---------------------------------------------------------------- briques
+
+component Bevel inherits Rectangle {
+    background: @linear-gradient(180deg, Theme.metal-1 0%, Theme.metal-2 100%);
+    border-width: 1px;
+    border-color: Theme.edge-lo;
+}
+
+component MetalButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon;          // commandes de chemin SVG (viewbox 16×16)
+    in property <bool> toggled;
+    in property <bool> big;
+    in property <string> tooltip;
+    callback clicked;
+    width: big ? 42px : max(32px, label-text.preferred-width + 14px);
+    height: big ? 34px : 28px;
+    border-radius: big ? self.height / 2 : 3px;
+    border-width: 1px;
+    border-color: #000;
+    background: big ? @linear-gradient(180deg, #ffab5c 0%, Theme.accent 45%, Theme.accent-dim 100%)
+        : toggled ? @linear-gradient(180deg, #1c2a21 0%, #0d140f 100%)
+        : touch.pressed ? #25272d
+        : @linear-gradient(180deg, #4a4e58 0%, #2a2c33 100%);
+    property <color> fg: big ? #1c1003 : toggled ? Theme.lcd : touch.has-hover ? Theme.accent : Theme.text;
+    if icon != "": Path {
+        width: 15px; height: 15px;
+        viewbox-width: 16; viewbox-height: 16;
+        commands: icon;
+        fill: fg;
+    }
+    label-text := Text {
+        text: icon == "" ? label : "";
+        color: fg;
+        font-size: 12px;
+        font-weight: 700;
+        font-family: Theme.mono;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+component SmallButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+    height: 22px;
+    min-width: t.preferred-width + 16px;
+    preferred-width: t.preferred-width + 16px;
+    horizontal-stretch: 0;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: #000;
+    background: touch.pressed ? #25272d : @linear-gradient(180deg, #4a4e58 0%, #2a2c33 100%);
+    t := Text { text: label; font-size: 10px; letter-spacing: 1px; color: touch.has-hover ? Theme.accent : Theme.text; font-family: Theme.mono; }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+component OrangeButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 32px;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: #000;
+    background: @linear-gradient(180deg, #ffab5c 0%, Theme.accent 45%, Theme.accent-dim 100%);
+    opacity: enabled ? (touch.has-hover ? 1.0 : 0.92) : 0.45;
+    Text { text: label; color: #1a0f02; font-weight: 800; letter-spacing: 2px; font-size: 13px; font-family: Theme.mono; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+component PanelTitle inherits Rectangle {
+    in property <string> title;
+    height: 18px;
+    background: @linear-gradient(180deg, Theme.title-1 0%, Theme.title-2 100%);
+    HorizontalLayout {
+        padding-left: 6px; padding-right: 6px; spacing: 6px;
+        Text { text: title; color: #e6d9b3; font-size: 10px; letter-spacing: 3px; vertical-alignment: center; font-family: Theme.mono; }
+        Rectangle {
+            Rectangle { y: parent.height / 2 - 1px; height: 2px; background: #c9a24a80; }
+        }
+        @children
+    }
+}
+
+// Curseur vertical façon égaliseur Winamp.
+component VSlider inherits Rectangle {
+    in property <string> label;
+    in-out property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    callback changed(float);
+    callback reset;
+    width: 42px;
+    VerticalLayout {
+        spacing: 4px;
+        track := Rectangle {
+            width: 16px;
+            min-height: 70px;
+            Rectangle { width: 4px; background: #0b0c0e; border-radius: 2px; border-width: 1px; border-color: #000; }
+            knob := Rectangle {
+                width: 16px; height: 10px;
+                y: (1 - (root.value - root.minimum) / (root.maximum - root.minimum)) * (track.height - self.height);
+                border-radius: 2px;
+                border-width: 1px; border-color: #000;
+                background: @linear-gradient(180deg, #ffab5c 0%, Theme.accent 50%, Theme.accent-dim 100%);
+            }
+            TouchArea {
+                function set(y: length) {
+                    root.value = clamp(root.maximum - (y - knob.height / 2) / (track.height - knob.height) * (root.maximum - root.minimum), root.minimum, root.maximum);
+                    root.changed(root.value);
+                }
+                pointer-event(e) => { if (e.kind == PointerEventKind.down) { self.set(self.mouse-y); } }
+                moved => { if (self.pressed) { self.set(self.mouse-y); } }
+                double-clicked => { root.reset(); }
+            }
+        }
+        Text { text: label; font-size: 9px; color: Theme.muted; horizontal-alignment: center; font-family: Theme.mono; }
+    }
+}
+
+// Liste déroulante au thème de l'app (LCD sombre, texte vert, flèche orange).
+component SkinCombo inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index;
+    callback selected(int);
+    height: 24px;
+    min-width: 60px;
+    preferred-width: 100px;
+    horizontal-stretch: 1;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.accent-dim : #000;
+    background: #0f1013;
+    HorizontalLayout {
+        padding-left: 7px; padding-right: 5px; spacing: 4px;
+        Text {
+            text: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "";
+            color: Theme.lcd; font-family: Theme.mono; font-size: 12px;
+            overflow: elide; vertical-alignment: center; horizontal-stretch: 1;
+        }
+        Path {
+            width: 9px; height: 6px; y: (root.height - 6px) / 2;
+            viewbox-width: 10; viewbox-height: 6;
+            commands: "M 0 0 L 10 0 L 5 6 Z";
+            fill: Theme.accent;
+        }
+    }
+    ta := TouchArea { clicked => { popup.show(); } }
+    popup := PopupWindow {
+        x: 0; y: root.height + 2px;
+        width: max(root.width, 190px);
+        height: min(root.model.length * 22px + 6px, 330px);
+        Rectangle {
+            background: #0a0b0d;
+            border-width: 1px; border-color: Theme.accent-dim; border-radius: 3px;
+            ListView {
+                x: 2px; y: 3px; width: parent.width - 4px; height: parent.height - 6px;
+                for item[i] in root.model: Rectangle {
+                    height: 22px;
+                    background: i == root.current-index ? #173d6b : item-ta.has-hover ? #1b2a20 : transparent;
+                    Text {
+                        x: 8px; width: parent.width - 16px;
+                        text: item; overflow: elide; vertical-alignment: center;
+                        color: i == root.current-index ? white : Theme.lcd; font-size: 12px;
+                    }
+                    item-ta := TouchArea { clicked => { root.current-index = i; root.selected(i); popup.close(); } }
+                }
+            }
+        }
+    }
+}
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 3px;
+    alignment: start;
+    horizontal-stretch: 1;
+    Text { text: label; font-size: 10px; letter-spacing: 1px; color: Theme.muted; font-family: Theme.mono; }
+    @children
+}
+
+// ---------------------------------------------------------------- fenêtre
+
+export component AppWindow inherits Window {
+    title: "YouTube Live Translator";
+    no-frame: true;
+    preferred-width: 1180px;
+    preferred-height: 800px;
+    min-width: 760px;
+    min-height: 560px;
+    background: transparent;
+    default-font-family: "Helvetica Neue";
+
+    // --- données envoyées par Rust
+    in property <[string]> languages;                 // langues sources, « Auto » en tête
+    in property <[string]> target-languages;          // langues cibles
+    in property <[PlItem]> playlist;
+    in property <[ResItem]> results;
+    in property <[TrItem]> transcript;
+    in property <[float]> bars: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+    in property <string> time-text: "00:00";
+    in property <string> dur-text: "00:00";
+    in property <float> position;                      // 0..1
+    in property <bool> playing;
+    in property <bool> has-video;
+    in property <string> marquee: "*** YOUTUBE LIVE TRANSLATOR *** AUCUNE VIDÉO ***";
+    in property <string> sub-main;
+    in property <string> sub-orig;
+    in property <string> tag-src: "SRC --";
+    in property <string> tag-dst: "DST --";
+    in property <string> tag-eng: "---";
+    in property <string> tag-cues: "0 CUES";
+    in property <float> job-progress;
+    in property <string> job-text: "PRÊT";
+    in property <int> job-kind;                        // 0 normal, 1 en cours, 2 erreur
+    in property <bool> generating;
+    in property <string> deps-text;
+    in property <string> status-text;
+    in property <string> toast-text;
+    in property <bool> toast-visible;
+    in property <string> results-empty: "Tapez une recherche dans la barre d'adresse.";
+    in property <bool> fullscreen;
+    in property <string> key-state;
+    in-out property <string> url-text;
+
+    // --- état propre à l'interface (lu par Rust)
+    in-out property <int> src-lang: 0;                 // index dans languages (0 = Auto)
+    in-out property <int> dst-lang: 2;                 // index sans « Auto »
+    in-out property <int> mode: 0;
+    in-out property <int> translator: 0;
+    in-out property <int> quality: 2;
+    in-out property <int> speed: 2;
+    in-out property <float> volume: 80;
+    in-out property <bool> muted;
+    in-out property <bool> subs-on: true;
+    in-out property <bool> dual;
+    in-out property <bool> loop;
+    in-out property <float> font-size: 28;
+    in-out property <float> sub-pos: 8;
+    in-out property <float> sub-bg: 55;
+    in-out property <float> offset: 0;                 // dixièmes de seconde (−50..50)
+    in-out property <int> tab: 0;
+    in-out property <string> filter-text;
+    in-out property <bool> settings-open;
+    in-out property <bool> about-open;
+    in-out property <int> whisper-model: 4;
+    in-out property <int> nmt-model: 0;
+
+    // --- zone vidéo (lue par Rust pour placer l'image de mpv)
+    out property <length> stage-x: stage.absolute-position.x;
+    out property <length> stage-y: stage.absolute-position.y;
+    out property <length> stage-w: stage.width;
+    out property <length> stage-h: stage.height;
+
+    // --- actions
+    callback open-url(string);
+    callback nav-back;
+    callback nav-forward;
+    callback reload;
+    callback toggle-play;
+    callback stop;
+    callback prev;
+    callback next;
+    callback seek-by(float);
+    callback seek-to(float);
+    callback volume-changed(float);
+    callback mute-changed(bool);
+    callback speed-changed(int);
+    callback quality-changed(int);
+    callback toggle-fullscreen;
+    callback generate(bool);
+    callback export-srt;
+    callback swap-langs;
+    callback prefs-changed;
+    callback subtitle-style-changed;
+    callback playlist-activate(int);
+    callback playlist-select(int);
+    callback playlist-add;
+    callback playlist-remove;
+    callback playlist-clear;
+    callback result-play(int);
+    callback result-add(int);
+    callback transcript-click(int);
+    callback filter-changed(string);
+    callback open-settings;
+    callback save-settings(string, int, int);
+    callback win-drag;
+    callback win-minimize;
+    callback win-maximize;
+    callback win-close;
+    callback win-resize;
+
+    MenuBar {
+        Menu {
+            title: "YouTube Live Translator";
+            MenuItem { title: "À propos de YouTube Live Translator"; activated => { root.about-open = true; } }
+            MenuItem { title: "Réglages…"; activated => { root.open-settings(); } }
+        }
+        Menu {
+            title: "Lecture";
+            MenuItem { title: "Lecture / Pause"; activated => { root.toggle-play(); } }
+            MenuItem { title: "Plein écran"; activated => { root.toggle-fullscreen(); } }
+            MenuItem { title: "Générer les sous-titres"; activated => { root.generate(false); } }
+        }
+    }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == " ") { root.toggle-play(); return accept; }
+            if (e.text == Key.LeftArrow) { root.seek-by(-5); return accept; }
+            if (e.text == Key.RightArrow) { root.seek-by(5); return accept; }
+            if (e.text == Key.UpArrow) { root.volume = min(100, root.volume + 5); root.volume-changed(root.volume); return accept; }
+            if (e.text == Key.DownArrow) { root.volume = max(0, root.volume - 5); root.volume-changed(root.volume); return accept; }
+            if (e.text == Key.Escape && root.fullscreen) { root.toggle-fullscreen(); return accept; }
+            if (e.text == "f") { root.toggle-fullscreen(); return accept; }
+            if (e.text == "s") { root.subs-on = !root.subs-on; root.subtitle-style-changed(); return accept; }
+            if (e.text == "d") { root.dual = !root.dual; root.subtitle-style-changed(); return accept; }
+            if (e.text == "m") { root.muted = !root.muted; root.mute-changed(root.muted); return accept; }
+            if (e.text == "n") { root.next(); return accept; }
+            if (e.text == "p") { root.prev(); return accept; }
+            if (e.text == "g") { root.generate(false); return accept; }
+            if (e.text == "l") { url-input.focus(); return accept; }
+            if (e.text == "[") { root.offset = max(-50, root.offset - 1); root.subtitle-style-changed(); return accept; }
+            if (e.text == "]") { root.offset = min(50, root.offset + 1); root.subtitle-style-changed(); return accept; }
+            reject
+        }
+
+        VerticalLayout {
+            // ---------------------------------------------------- barre de titre (déplaçable)
+            if !root.fullscreen: Rectangle {
+                height: 22px;
+                background: @linear-gradient(180deg, #2c3f7a 0%, #17214a 55%, #10183a 100%);
+                TouchArea {
+                    pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.win-drag(); } }
+                    double-clicked => { root.win-maximize(); }
+                }
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 4px; spacing: 8px;
+                    alignment: stretch;
+                    Path {
+                        width: 14px; height: 14px; y: 4px;
+                        viewbox-width: 16; viewbox-height: 16;
+                        commands: "M 2 2 L 14 2 L 14 11 L 8 11 L 5 14 L 5 11 L 2 11 Z";
+                        fill: Theme.accent;
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        for i in 3: Rectangle { y: 7px + i * 3px; height: 1px; background: #c9a24a90; }
+                    }
+                    Text { text: "YOUTUBE LIVE TRANSLATOR"; font-size: 11px; letter-spacing: 3px; color: #f2e6c4; vertical-alignment: center; font-family: Theme.mono; }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        for i in 3: Rectangle { y: 7px + i * 3px; height: 1px; background: #c9a24a90; }
+                    }
+                    HorizontalLayout {
+                        spacing: 2px; padding-top: 3px; padding-bottom: 3px;
+                        for b[i] in ["_", "□", "×"]: Rectangle {
+                            width: 18px;
+                            border-radius: 2px; border-width: 1px; border-color: #000;
+                            background: ta.has-hover ? (i == 2 ? #c0392b : #7b8190) : #4a4f5a;
+                            Text { text: b; color: #e8e8e8; font-size: 11px; }
+                            ta := TouchArea {
+                                clicked => {
+                                    if (i == 0) { root.win-minimize(); }
+                                    if (i == 1) { root.win-maximize(); }
+                                    if (i == 2) { root.win-close(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------- barre d'adresse
+            Bevel {
+                visible: !root.fullscreen;
+                height: root.fullscreen ? 0px : 38px;
+                HorizontalLayout {
+                    padding: 6px; spacing: 6px;
+                    MetalButton { icon: "M 11 2 L 11 14 L 3 8 Z"; clicked => { root.nav-back(); } }
+                    MetalButton { icon: "M 5 2 L 5 14 L 13 8 Z"; clicked => { root.nav-forward(); } }
+                    MetalButton { icon: "M 8 2 C 11 2 14 5 14 8 L 16 8 L 12.5 12 L 9 8 L 11 8 C 11 6 10 5 8 5 C 6 5 5 6.5 5 8 C 5 9.5 6 11 8 11 L 8 14 C 4.5 14 2 11 2 8 C 2 5 4.5 2 8 2 Z"; clicked => { root.reload(); } }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: Theme.lcd-bg;
+                        border-width: 1px; border-color: #000; border-radius: 3px;
+                        HorizontalLayout {
+                            padding-left: 9px; padding-right: 6px; spacing: 6px;
+                            Text { text: "▶"; color: Theme.accent; font-size: 10px; vertical-alignment: center; }
+                            url-input := TextInput {
+                                horizontal-stretch: 1;
+                                horizontal-alignment: left;
+                                text <=> root.url-text;
+                                color: Theme.lcd;
+                                font-family: Theme.mono;
+                                font-size: 15px;
+                                vertical-alignment: center;
+                                single-line: true;
+                                accepted => { root.open-url(self.text); keys.focus(); }
+                            }
+                        }
+                        if root.url-text == "": Text {
+                            x: 28px;
+                            text: "Collez une URL YouTube… ou tapez une recherche";
+                            color: Theme.lcd-dim; font-family: Theme.mono; font-size: 15px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    OrangeButton { width: 90px; height: 26px; label: "OUVRIR"; clicked => { root.open-url(root.url-text); keys.focus(); } }
+                }
+            }
+
+            // ---------------------------------------------------- corps
+            HorizontalLayout {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    // Écran : transparent, mpv dessine la vidéo en dessous.
+                    stage := Rectangle {
+                        vertical-stretch: 1;
+                        background: root.has-video ? transparent : #000;
+                        clip: true;
+                        if !root.has-video: VerticalLayout {
+                            alignment: center; spacing: 10px;
+                            Path {
+                                height: 96px; width: 96px;
+                                x: (parent.width - 96px) / 2;
+                                viewbox-width: 64; viewbox-height: 64;
+                                commands: "M 6 6 L 58 6 L 58 42 L 30 42 L 18 54 L 18 42 L 6 42 Z";
+                                fill: Theme.accent;
+                            }
+                            Text { text: "Collez l'URL d'une vidéo YouTube en haut,\npuis générez des sous-titres dans la langue de votre choix."; color: Theme.muted; horizontal-alignment: center; font-size: 13px; }
+                            Text { text: "Espace lecture/pause · ←/→ ±5 s · F plein écran · S sous-titres · D double ligne"; color: #5d6270; horizontal-alignment: center; font-size: 11px; }
+                        }
+                        TouchArea {
+                            clicked => { if (root.has-video) { root.toggle-play(); } keys.focus(); }
+                            double-clicked => { root.toggle-fullscreen(); }
+                        }
+                        // Sous-titres
+                        if root.subs-on && (root.sub-main != "" || (root.dual && root.sub-orig != "")): VerticalLayout {
+                            x: parent.width * 0.04;
+                            width: parent.width * 0.92;
+                            height: self.preferred-height;
+                            y: parent.height * (1 - root.sub-pos / 100) - self.preferred-height;
+                            spacing: 4px;
+                            if root.dual && root.sub-orig != "": HorizontalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    background: rgba(0, 0, 0, root.sub-bg / 100);
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding-left: 10px; padding-right: 10px; padding-top: 2px; padding-bottom: 2px;
+                                        Text {
+                                            text: root.sub-orig; color: #ffe7a8; wrap: word-wrap;
+                                            horizontal-alignment: center;
+                                            font-size: root.font-size * 0.68 * 1px; font-weight: 500;
+                                        }
+                                    }
+                                }
+                            }
+                            if root.sub-main != "": HorizontalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    background: rgba(0, 0, 0, root.sub-bg / 100);
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding-left: 10px; padding-right: 10px; padding-top: 2px; padding-bottom: 2px;
+                                        Text {
+                                            text: root.sub-main; color: white; wrap: word-wrap;
+                                            horizontal-alignment: center;
+                                            font-size: root.font-size * 1px; font-weight: 600;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if root.toast-visible: Rectangle {
+                            x: parent.width - self.width - 14px; y: 14px;
+                            width: toast.preferred-width + 24px; height: 32px;
+                            background: #050806e0; border-width: 1px; border-color: Theme.lcd-dim;
+                            toast := Text { text: root.toast-text; color: Theme.lcd; font-family: Theme.mono; font-size: 16px; }
+                        }
+                    }
+
+                    // Contrôles façon VLC
+                    if !root.fullscreen || stage-hover.has-hover: Bevel {
+                        height: 78px;
+                        VerticalLayout {
+                            padding: 8px; padding-top: 6px; spacing: 7px;
+                            HorizontalLayout {
+                                spacing: 10px; height: 18px;
+                                Text { text: root.time-text; color: Theme.text; font-family: Theme.mono; font-size: 15px; min-width: 60px; horizontal-alignment: center; vertical-alignment: center; }
+                                seek := Rectangle {
+                                    horizontal-stretch: 1;
+                                    property <float> shown: seek-ta.pressed ? clamp(seek-ta.mouse-x / self.width, 0, 1) : root.position;
+                                    Rectangle { height: 10px; border-radius: 5px; background: #0d0e11; border-width: 1px; border-color: #000; }
+                                    Rectangle {
+                                        x: 0; height: 10px; border-radius: 5px;
+                                        width: parent.width * parent.shown;
+                                        background: @linear-gradient(180deg, #ffb163 0%, Theme.accent 50%, Theme.accent-dim 100%);
+                                    }
+                                    Rectangle {
+                                        width: 14px; height: 14px; border-radius: 7px;
+                                        x: parent.width * parent.shown - 7px;
+                                        background: @radial-gradient(circle, #ffffff 0%, #bbbbbb 45%, #666666 100%);
+                                        border-width: 1px; border-color: #000;
+                                    }
+                                    seek-ta := TouchArea {
+                                        pointer-event(e) => {
+                                            if (e.kind == PointerEventKind.up) { root.seek-to(clamp(self.mouse-x / parent.width, 0, 1)); keys.focus(); }
+                                        }
+                                    }
+                                }
+                                Text { text: root.dur-text; color: Theme.text; font-family: Theme.mono; font-size: 15px; min-width: 60px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            HorizontalLayout {
+                                spacing: 4px; alignment: start;
+                                MetalButton { big: true; icon: root.playing ? "M 3 2 L 7 2 L 7 14 L 3 14 Z M 9 2 L 13 2 L 13 14 L 9 14 Z" : "M 4 2 L 4 14 L 14 8 Z"; clicked => { root.toggle-play(); } }
+                                MetalButton { icon: "M 3 2 L 5 2 L 5 14 L 3 14 Z M 14 2 L 14 14 L 6 8 Z"; clicked => { root.prev(); } }
+                                MetalButton { icon: "M 3 3 L 13 3 L 13 13 L 3 13 Z"; clicked => { root.stop(); } }
+                                MetalButton { icon: "M 11 2 L 13 2 L 13 14 L 11 14 Z M 2 2 L 2 14 L 10 8 Z"; clicked => { root.next(); } }
+                                Rectangle { width: 6px; }
+                                MetalButton { icon: "M 8 3 L 8 13 L 2 8 Z M 15 3 L 15 13 L 9 8 Z"; clicked => { root.seek-by(-10); } }
+                                MetalButton { icon: "M 1 3 L 7 8 L 1 13 Z M 8 3 L 14 8 L 8 13 Z"; clicked => { root.seek-by(10); } }
+                                Rectangle { width: 6px; }
+                                MetalButton { label: "CC"; toggled: root.subs-on; clicked => { root.subs-on = !root.subs-on; root.subtitle-style-changed(); } }
+                                MetalButton { label: "2L"; toggled: root.dual; clicked => { root.dual = !root.dual; root.subtitle-style-changed(); } }
+                                MetalButton { icon: "M 3 5 L 11 5 L 11 2 L 15 6 L 11 10 L 11 7 L 5 7 L 5 9 L 3 9 Z M 13 11 L 5 11 L 5 14 L 1 10 L 5 6 L 5 9 L 11 9 L 11 7 L 13 7 Z"; toggled: root.loop; clicked => { root.loop = !root.loop; } }
+                                MetalButton { icon: "M 1 1 L 6 1 L 6 3 L 3 3 L 3 6 L 1 6 Z M 10 1 L 15 1 L 15 6 L 13 6 L 13 3 L 10 3 Z M 1 10 L 3 10 L 3 13 L 6 13 L 6 15 L 1 15 Z M 13 10 L 15 10 L 15 15 L 10 15 L 10 13 L 13 13 Z"; clicked => { root.toggle-fullscreen(); } }
+                                Rectangle { horizontal-stretch: 1; }
+                                SkinCombo {
+                                    width: 80px; y: 2px;
+                                    model: ["360p", "480p", "720p", "1080p"];
+                                    current-index <=> root.quality;
+                                    selected => { root.quality-changed(self.current-index); keys.focus(); }
+                                }
+                                SkinCombo {
+                                    width: 70px; y: 2px;
+                                    model: ["0.5×", "0.75×", "1×", "1.25×", "1.5×", "2×"];
+                                    current-index <=> root.speed;
+                                    selected => { root.speed-changed(self.current-index); keys.focus(); }
+                                }
+                                MetalButton {
+                                    icon: root.muted ? "M 1 6 L 4 6 L 8 2 L 8 14 L 4 10 L 1 10 Z M 10 5 L 11 4 L 13 6 L 15 4 L 16 5 L 14 7 L 16 9 L 15 10 L 13 8 L 11 10 L 10 9 L 12 7 Z"
+                                        : "M 1 6 L 4 6 L 8 2 L 8 14 L 4 10 L 1 10 Z M 10 5 L 11 5 C 12 6 12 10 11 11 L 10 11 C 11 10 11 6 10 5 Z M 12 3 L 13 3 C 15 5 15 11 13 13 L 12 13 C 14 11 14 5 12 3 Z";
+                                    clicked => { root.muted = !root.muted; root.mute-changed(root.muted); }
+                                }
+                                vol := Rectangle {
+                                    width: 90px; height: 22px; y: 3px;
+                                    Path {
+                                        width: 100%; height: 100%;
+                                        viewbox-width: 100; viewbox-height: 22;
+                                        commands: "M 0 22 L 100 22 L 100 0 Z";
+                                        fill: #0d0e11;
+                                    }
+                                    Path {
+                                        width: 100%; height: 100%;
+                                        viewbox-width: 100; viewbox-height: 22;
+                                        commands: "M 0 22 L " + root.volume + " 22 L " + root.volume + " " + (22 - root.volume * 0.22) + " Z";
+                                        fill: @linear-gradient(90deg, #2bd46b 0%, Theme.warn 70%, Theme.danger 100%);
+                                    }
+                                    TouchArea {
+                                        function set(x: length) { root.volume = clamp(x / vol.width * 100, 0, 100); root.volume-changed(root.volume); }
+                                        pointer-event(e) => { if (e.kind == PointerEventKind.down) { self.set(self.mouse-x); } }
+                                        moved => { if (self.pressed) { self.set(self.mouse-x); } }
+                                        scroll-event(e) => { root.volume = clamp(root.volume + (e.delta-y > 0 ? 5 : -5), 0, 100); root.volume-changed(root.volume); accept }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // -------------------------------------------------- colonne Winamp
+                if !root.fullscreen: Rectangle {
+                    width: 340px;
+                    background: #0c0d10;
+                    VerticalLayout {
+                        padding: 2px; spacing: 2px;
+
+                        // Écran LCD
+                        Bevel {
+                            VerticalLayout {
+                                PanelTitle { title: "PLAYER"; }
+                                Rectangle {
+                                    background: Theme.lcd-bg;
+                                    border-width: 1px; border-color: #000;
+                                    VerticalLayout {
+                                        padding: 8px; spacing: 4px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Path {
+                                                width: 16px; height: 16px; y: 12px;
+                                                viewbox-width: 16; viewbox-height: 16;
+                                                commands: root.playing ? "M 3 2 L 14 8 L 3 14 Z" : root.has-video ? "M 3 2 L 6 2 L 6 14 L 3 14 Z M 10 2 L 13 2 L 13 14 L 10 14 Z" : "M 3 3 L 13 3 L 13 13 L 3 13 Z";
+                                                fill: Theme.lcd;
+                                            }
+                                            Text { text: root.time-text; color: Theme.lcd; font-size: 36px; font-family: Theme.mono; font-weight: 700; vertical-alignment: center; min-width: 118px; }
+                                            viz := Rectangle {
+                                                horizontal-stretch: 1; height: 34px;
+                                                for v[i] in root.bars: Rectangle {
+                                                    x: i * viz.width / root.bars.length + 1px;
+                                                    width: viz.width / root.bars.length - 2px;
+                                                    y: viz.height - self.height;
+                                                    height: max(1px, v * viz.height);
+                                                    background: @linear-gradient(0deg, Theme.lcd 0%, Theme.lcd 55%, Theme.warn 80%, Theme.danger 100%);
+                                                }
+                                            }
+                                        }
+                                        mq := Rectangle {
+                                            height: 22px; clip: true;
+                                            border-width: 0px;
+                                            Rectangle { y: 0; height: 1px; background: Theme.lcd-dim; }
+                                            mq-text := Text {
+                                                y: 3px;
+                                                x: mq.width - mod(animation-tick() / 30ms, (mq.width + self.width) / 1px) * 1px;
+                                                text: root.marquee; color: Theme.lcd; font-size: 15px; font-family: Theme.mono;
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 4px; alignment: start;
+                                            for t in [root.tag-src, root.tag-dst, root.tag-eng, root.tag-cues]: Rectangle {
+                                                border-width: 1px; border-color: Theme.lcd-dim;
+                                                width: tt.preferred-width + 10px; height: 18px;
+                                                tt := Text { text: t; color: Theme.lcd; font-size: 11px; font-family: Theme.mono; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // « Égaliseur » des sous-titres
+                        Bevel {
+                            VerticalLayout {
+                                PanelTitle {
+                                    title: "SOUS-TITRES";
+                                    Text {
+                                        text: "⚙"; color: gear.has-hover ? Theme.accent : #e6d9b3; font-size: 13px; vertical-alignment: center;
+                                        gear := TouchArea { clicked => { root.open-settings(); } }
+                                    }
+                                }
+                                VerticalLayout {
+                                    padding: 8px; spacing: 8px;
+                                    alignment: start;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Field {
+                                            label: "DE";
+                                            SkinCombo {
+                                                                                                model: root.languages;
+                                                current-index <=> root.src-lang;
+                                                selected => { root.prefs-changed(); keys.focus(); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: end;
+                                            MetalButton {
+                                                height: 24px;
+                                                icon: "M 2 4 L 11 4 L 11 1 L 15 5 L 11 9 L 11 6 L 2 6 Z M 14 12 L 5 12 L 5 15 L 1 11 L 5 7 L 5 10 L 14 10 Z";
+                                                clicked => { root.swap-langs(); }
+                                            }
+                                        }
+                                        Field {
+                                            label: "VERS";
+                                            SkinCombo {
+                                                                                                model: root.target-languages;
+                                                current-index <=> root.dst-lang;
+                                                selected => { root.prefs-changed(); keys.focus(); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Field {
+                                            label: "SOURCE";
+                                            SkinCombo {
+                                                                                                model: ["YouTube, sinon Whisper", "Sous-titres YouTube", "Whisper (local)"];
+                                                current-index <=> root.mode;
+                                                selected => { root.prefs-changed(); keys.focus(); }
+                                            }
+                                        }
+                                        Field {
+                                            label: "TRADUCTEUR";
+                                            SkinCombo {
+                                                                                                model: ["Local NMT (hors ligne)", "Google (gratuit)", "Claude (clé API)", "YouTube auto"];
+                                                current-index <=> root.translator;
+                                                selected => { root.prefs-changed(); keys.focus(); }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        background: #121317; border-width: 1px; border-color: #000;
+                                        HorizontalLayout {
+                                            padding: 6px; spacing: 4px;
+                                            VSlider { label: "TAILLE"; minimum: 16; maximum: 56; value <=> root.font-size; changed => { root.subtitle-style-changed(); } reset => { root.font-size = 28; root.subtitle-style-changed(); } }
+                                            VSlider { label: "HAUT."; minimum: 2; maximum: 40; value <=> root.sub-pos; changed => { root.subtitle-style-changed(); } reset => { root.sub-pos = 8; root.subtitle-style-changed(); } }
+                                            VSlider { label: "FOND"; minimum: 0; maximum: 100; value <=> root.sub-bg; changed => { root.subtitle-style-changed(); } reset => { root.sub-bg = 55; root.subtitle-style-changed(); } }
+                                            VSlider {
+                                                label: "SYNC " + (root.offset >= 0 ? "+" : "") + round(root.offset) / 10 + "s";
+                                                minimum: -50; maximum: 50; value <=> root.offset;
+                                                changed => { root.subtitle-style-changed(); }
+                                                reset => { root.offset = 0; root.subtitle-style-changed(); }
+                                            }
+                                            VerticalLayout {
+                                                horizontal-stretch: 1; spacing: 4px; alignment: center;
+                                                OrangeButton { label: "GÉNÉRER"; enabled: !root.generating; clicked => { root.generate(false); } }
+                                                SmallButton { label: "REGÉNÉRER"; clicked => { root.generate(true); } }
+                                                SmallButton { label: "EXPORT .SRT"; clicked => { root.export-srt(); } }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 20px; background: Theme.lcd-bg; border-width: 1px; border-color: #000; clip: true;
+                                        Rectangle {
+                                            x: 0; width: parent.width * root.job-progress;
+                                            background: root.job-kind == 2 ? #5c1a15 : Theme.lcd-dim;
+                                        }
+                                        Text {
+                                            x: 6px; width: parent.width - 12px;
+                                            text: root.job-text; color: root.job-kind == 2 ? Theme.danger : Theme.lcd;
+                                            font-family: Theme.mono; font-size: 12px; vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Playlist / transcription / recherche
+                        Bevel {
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                Rectangle {
+                                    height: 18px;
+                                    background: @linear-gradient(180deg, Theme.title-1 0%, Theme.title-2 100%);
+                                    HorizontalLayout {
+                                        padding-left: 2px; padding-right: 2px; spacing: 2px;
+                                        for name[i] in ["PLAYLIST", "TRANSCRIPTION", "RECHERCHE"]: Rectangle {
+                                            background: root.tab == i ? #00000060 : transparent;
+                                            Text { text: name; color: root.tab == i ? Theme.accent : #9ea6c8; font-size: 9px; letter-spacing: 2px; font-family: Theme.mono; }
+                                            TouchArea { clicked => { root.tab = i; } }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    background: Theme.lcd-bg;
+                                    if root.tab == 0: VerticalLayout {
+                                        if root.playlist.length == 0: Text {
+                                            text: "Playlist vide. Ouvrez une vidéo ou utilisez la recherche."; wrap: word-wrap;
+                                            color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px;
+                                        }
+                                        ListView {
+                                            vertical-stretch: 1;
+                                            for item[i] in root.playlist: Rectangle {
+                                                height: 22px;
+                                                background: item.sel ? #173d6b : pl-ta.has-hover ? #0f2217 : transparent;
+                                                HorizontalLayout {
+                                                    padding-left: 8px; padding-right: 8px; spacing: 6px;
+                                                    Text { text: (i + 1) + "."; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px; width: 26px; horizontal-alignment: right; vertical-alignment: center; }
+                                                    Text { text: item.title; color: item.playing ? white : Theme.lcd; font-family: Theme.mono; font-size: 13px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                                    Text { text: item.playing ? "♪" : ""; color: Theme.lcd; vertical-alignment: center; }
+                                                }
+                                                pl-ta := TouchArea {
+                                                    clicked => { root.playlist-select(i); }
+                                                    double-clicked => { root.playlist-activate(i); }
+                                                }
+                                            }
+                                        }
+                                        Bevel {
+                                            height: 30px;
+                                            HorizontalLayout {
+                                                padding: 4px; spacing: 4px;
+                                                SmallButton { label: "+ AJOUTER"; clicked => { root.playlist-add(); } }
+                                                SmallButton { label: "− RETIRER"; clicked => { root.playlist-remove(); } }
+                                                SmallButton { label: "VIDER"; clicked => { root.playlist-clear(); } }
+                                                Rectangle { horizontal-stretch: 1; }
+                                                Text { text: root.playlist.length + " élém."; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                                            }
+                                        }
+                                    }
+                                    if root.tab == 1: VerticalLayout {
+                                        padding: 4px; spacing: 4px;
+                                        Rectangle {
+                                            height: 24px; border-width: 1px; border-color: Theme.lcd-dim; background: #0f1013;
+                                            filter-input := TextInput {
+                                                x: 6px; width: parent.width - 12px;
+                                                text <=> root.filter-text; color: Theme.lcd; font-family: Theme.mono; font-size: 13px;
+                                                vertical-alignment: center; single-line: true;
+                                                edited => { root.filter-changed(self.text); }
+                                            }
+                                            if root.filter-text == "": Text { x: 6px; text: "Filtrer la transcription…"; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px; vertical-alignment: center; }
+                                        }
+                                        if root.transcript.length == 0: Text {
+                                            text: "Aucune transcription — cliquez sur GÉNÉRER."; wrap: word-wrap;
+                                            color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px;
+                                        }
+                                        ListView {
+                                            vertical-stretch: 1;
+                                            for item[i] in root.transcript: Rectangle {
+                                                height: tr-layout.preferred-height;
+                                                background: item.now ? #173d6b : tr-ta.has-hover ? #0f2217 : transparent;
+                                                tr-layout := HorizontalLayout {
+                                                    padding: 3px; padding-left: 6px; spacing: 6px;
+                                                    Text { text: item.time; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 12px; width: 52px; }
+                                                    VerticalLayout {
+                                                        horizontal-stretch: 1;
+                                                        Text { text: item.text; color: item.now ? white : Theme.lcd; wrap: word-wrap; font-size: 13px; }
+                                                        if item.orig != item.text: Text { text: item.orig; color: #b9a46a; wrap: word-wrap; font-size: 11px; }
+                                                    }
+                                                }
+                                                tr-ta := TouchArea { clicked => { root.transcript-click(i); } }
+                                            }
+                                        }
+                                    }
+                                    if root.tab == 2: VerticalLayout {
+                                        if root.results.length == 0: Text {
+                                            text: root.results-empty; wrap: word-wrap;
+                                            color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px;
+                                        }
+                                        ListView {
+                                            vertical-stretch: 1;
+                                            for item[i] in root.results: Rectangle {
+                                                height: 22px;
+                                                background: rs-ta.has-hover ? #0f2217 : transparent;
+                                                HorizontalLayout {
+                                                    padding-left: 8px; padding-right: 8px; spacing: 6px;
+                                                    Text { text: (i + 1) + "."; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px; width: 26px; horizontal-alignment: right; vertical-alignment: center; }
+                                                    Text { text: item.title; color: Theme.lcd; font-size: 13px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                                    Text { text: item.duration; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 12px; vertical-alignment: center; }
+                                                }
+                                                rs-ta := TouchArea {
+                                                    double-clicked => { root.result-play(i); }
+                                                    pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.result-add(i); } }
+                                                }
+                                            }
+                                        }
+                                        Text { text: "Double-clic : lire · Clic droit : ajouter à la playlist"; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------- barre d'état
+            if !root.fullscreen: Bevel {
+                height: 20px;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 22px; spacing: 12px;
+                    Text { text: root.deps-text; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.status-text; color: Theme.muted; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                }
+                Rectangle {
+                    x: parent.width - 16px; y: parent.height - 16px; width: 14px; height: 14px;
+                    for i in 3: Rectangle { x: 10px - i * 4px; y: 10px; width: 2px; height: 2px; background: Theme.edge-hi; }
+                    TouchArea { mouse-cursor: nwse-resize; pointer-event(e) => { if (e.kind == PointerEventKind.down) { root.win-resize(); } } }
+                }
+            }
+        }
+
+        // Survol du bas de l'écran en plein écran : réaffiche les contrôles.
+        stage-hover := TouchArea {
+            visible: root.fullscreen;
+            y: parent.height - 90px; height: 90px;
+            clicked => { root.toggle-play(); }
+        }
+    }
+
+    // ---------------------------------------------------- réglages
+    if root.settings-open: Rectangle {
+        background: #000000a0;
+        TouchArea { }
+        Bevel {
+            width: min(480px, parent.width - 32px);
+            height: settings-layout.preferred-height;
+            settings-layout := VerticalLayout {
+                padding: 16px; spacing: 12px;
+                Text { text: "RÉGLAGES"; color: Theme.accent; font-size: 13px; letter-spacing: 3px; font-family: Theme.mono; }
+                Field {
+                    label: "Clé API Anthropic (pour le traducteur Claude)";
+                    key-input := LineEdit { input-type: password; placeholder-text: "sk-ant-… (vide = garder l'actuelle)"; }
+                }
+                Text { text: root.key-state; color: Theme.muted; font-size: 11px; }
+                Field {
+                    label: "Modèle Whisper (transcription locale)";
+                    SkinCombo {
+                        model: ["tiny — 75 Mo, très rapide", "base — 142 Mo", "small — 466 Mo", "medium — 1,5 Go", "large-v3-turbo — 550 Mo, recommandé"];
+                        current-index <=> root.whisper-model;
+                    }
+                }
+                Field {
+                    label: "Traduction locale (NMT, hors ligne)";
+                    SkinCombo {
+                        model: ["NLLB 1.3B — meilleure qualité (~1,4 Go RAM)", "NLLB 600M — léger (~650 Mo RAM)"];
+                        current-index <=> root.nmt-model;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px; alignment: end;
+                    SmallButton { label: "ANNULER"; clicked => { key-input.text = ""; root.settings-open = false; } }
+                    OrangeButton {
+                        width: 150px; label: "ENREGISTRER";
+                        clicked => { root.save-settings(key-input.text, root.whisper-model, root.nmt-model); key-input.text = ""; root.settings-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------- à propos (exigé par la licence Slint)
+    if root.about-open: Rectangle {
+        background: #000000a0;
+        TouchArea { clicked => { root.about-open = false; } }
+        Bevel {
+            width: min(460px, parent.width - 32px);
+            height: about-layout.preferred-height;
+            about-layout := VerticalLayout {
+                padding: 18px; spacing: 10px;
+                Text { text: "YOUTUBE LIVE TRANSLATOR"; color: Theme.accent; font-size: 14px; letter-spacing: 3px; font-family: Theme.mono; horizontal-alignment: center; }
+                Text { text: "Sous-titres générés et traduits en local : Whisper (whisper.cpp) + NLLB-200 (CTranslate2). Lecture vidéo : mpv."; color: Theme.text; wrap: word-wrap; horizontal-alignment: center; font-size: 12px; }
+                Text { text: "Licence MIT · NLLB-200 : usage non commercial (CC-BY-NC 4.0)"; color: Theme.muted; horizontal-alignment: center; font-size: 11px; }
+                AboutSlint { }
+                HorizontalLayout { alignment: center; SmallButton { label: "FERMER"; clicked => { root.about-open = false; } } }
+            }
+        }
+    }
+}

@@ -216,62 +216,7 @@ pub async fn download_audio(id: &str, dir: &Path) -> Result<PathBuf> {
     Err(last_err)
 }
 
-/// Flux directs lisibles par une balise `<video>` : vidéo H.264 + audio AAC séparés
-/// (YouTube ne sert presque plus de flux combinés), ou un manifeste HLS pour les directs.
 #[derive(Debug, Clone, Serialize)]
-pub struct Streams {
-    pub title: String,
-    pub is_live: bool,
-    pub video: String,
-    pub audio: Option<String>,
-    pub hls: bool,
-}
-
-pub async fn streams(id: &str, max_height: u32) -> Result<Streams> {
-    let h = max_height;
-    let selector = format!(
-        "bv*[vcodec^=avc1][height<={h}][protocol=https]+ba[ext=m4a][protocol=https]\
-         /b[vcodec^=avc1][height<={h}][protocol=https]\
-         /bv*[height<={h}][protocol=https]+ba[protocol=https]\
-         /b[protocol*=m3u8]/b"
-    );
-    let mut cmd = ytdlp()?;
-    cmd.args(["--no-warnings", "--no-playlist", "-f", &selector])
-        .args(["-O", "%(title)s", "-O", "%(is_live)s", "-O", "%(urls)s"])
-        .arg(watch_url(id));
-    let out = run(cmd).await?;
-    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
-    let title = lines.next().unwrap_or_default().to_string();
-    let is_live = lines.next() == Some("True");
-    let urls: Vec<String> = lines.filter(|l| l.starts_with("http")).map(String::from).collect();
-    let video = urls.first().cloned().ok_or_else(|| anyhow!("aucun flux lisible pour cette vidéo"))?;
-    let hls = video.contains(".m3u8") || video.contains("/manifest/hls");
-    Ok(Streams { title, is_live, audio: urls.get(1).cloned(), video, hls })
-}
-
-/// Manifeste HLS « maître » (audio + vidéo, qualité adaptative). WebKit le lit nativement,
-/// sans les coupures qu'il a sur les MP4 fragmentés de YouTube.
-pub async fn hls_master(id: &str) -> Result<Streams> {
-    let mut cmd = ytdlp()?;
-    cmd.args(["-J", "--no-warnings", "--no-playlist"]).arg(watch_url(id));
-    let json: serde_json::Value = serde_json::from_str(&run(cmd).await?)?;
-    let manifest = json["formats"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| f["manifest_url"].as_str())
-        .find(|u| u.contains("m3u8") || u.contains("/manifest/hls"))
-        .ok_or_else(|| anyhow!("pas de flux HLS pour cette vidéo"))?;
-    Ok(Streams {
-        title: json["title"].as_str().unwrap_or_default().to_string(),
-        is_live: json["is_live"].as_bool().unwrap_or(false),
-        video: manifest.to_string(),
-        audio: None,
-        hls: true,
-    })
-}
-
-#[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub id: String,
     pub title: String,

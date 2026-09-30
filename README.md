@@ -1,6 +1,6 @@
 # YouTube Live Translator
 
-A small Rust browser (tao + wry) with a **VLC × Winamp** style interface. It plays a YouTube video from its URL and shows **generated and translated subtitles**, from and to **24 languages**.
+A Rust video player with a **VLC × Winamp** style interface (**Slint** + **mpv**). It plays a YouTube video from its URL and shows **generated and translated subtitles**, from and to **24 languages**.
 
 **Supported languages:**
 
@@ -15,7 +15,7 @@ Every language works as a source (spoken in the video) and as a target (for the 
 Everything runs **locally on your Mac**:
 - **Transcription:** Whisper, compiled into the app.
 - **Translation:** NLLB, compiled into the app.
-- **No API or account needed.** The only external tool is `yt-dlp`, which reads YouTube.
+- **No API or account needed.** The app relies on two external tools: `yt-dlp`, which reads YouTube, and `mpv`, which plays the video.
 
 ![icon](assets/icon.png)
 
@@ -42,7 +42,7 @@ Everything runs **locally on your Mac**:
 
 ## Features
 
-- **Native video playback** from a YouTube URL, with an iframe player as a fallback.
+- **Video playback with mpv** (the engine VLC-style players are built on), embedded in the window: hardware decoding, quality from 360p to 1080p, speed from 0.5× to 2×.
 - **Subtitles**, from one of two sources:
   - YouTube's own subtitles, manual or automatic;
   - a **local transcription with Whisper**, which also works on songs.
@@ -69,13 +69,14 @@ Everything runs **locally on your Mac**:
 | Homebrew | package manager | https://brew.sh |
 | `cmake` | **at build time only**: compiles whisper.cpp and CTranslate2 | `brew install cmake` |
 | `yt-dlp` | **at runtime**: reads YouTube | `brew install yt-dlp` |
+| `mpv` | **at runtime**: plays the video (libmpv) | `brew install mpv` |
 
 ### Build and install
 
 ```bash
 git clone https://github.com/younss/youtube_live_translator.git
 cd youtube_live_translator
-brew install cmake yt-dlp
+brew install cmake yt-dlp mpv
 ./scripts/install.sh
 ```
 
@@ -205,10 +206,7 @@ Every video you open is added automatically. At the end of the list, **Élément
 - **Buttons:** ▶/❚❚ (play/pause), ⏮ / ⏭ (previous / next), ■ (stop), ↺ / ↻ (back / forward 10 s), ↻ (loop), ⛶ (full screen).
 - **Progress bar:** click or drag to seek.
 - **Volume:** click, drag, or use the mouse wheel.
-- **NATIF / YOUTUBE:** the playback engine.
-  - NATIF (recommended) uses the app's own player.
-  - YOUTUBE uses the embedded player. The app switches to it automatically if the video refuses native playback, and vice versa.
-- **360p … 1080p:** quality of the native player, applied to the next video you open.
+- **360p … 1080p:** video quality. Changing it reloads the current video at the same position.
 - **0.5× … 2×:** playback speed.
 
 ### Full screen
@@ -287,7 +285,6 @@ security delete-generic-password -s com.younss.ytlt -a anthropic-api-key 2>/dev/
 |---|---|
 | `ERREUR : yt-dlp : …` / "unable to download" / 403 | Update yt-dlp: `brew upgrade yt-dlp`. YouTube changes its protections regularly. |
 | `yt-dlp` shows red in the status bar | `brew install yt-dlp`. The app looks in `PATH`, `/opt/homebrew/bin` and `/usr/local/bin`. |
-| "This video is unavailable" in the YOUTUBE engine | The author has blocked embedded playback. Switch to **NATIF**. |
 | No subtitles on a video | It has no YouTube subtitles: pick **SOURCE → Whisper (local)**. |
 | Subtitles missing on part of a song | Whisper struggles with instrumental passages and heavy music. Set **DE** to the exact language, then **REGÉNÉRER**. |
 | Subtitles slightly early or late | **SYNC** slider, or the `[` / `]` keys. |
@@ -295,7 +292,7 @@ security delete-generic-password -s com.younss.ytlt -a anthropic-api-key 2>/dev/
 | "Aucune clé API Claude configurée" | Add a key in ⚙, or pick another translator. |
 | High memory use | It's normal during a transcription (Whisper + NMT, up to ~2.5 GB with NLLB 1.3B). Memory drops back about 1 minute after the translation. For less, pick **NLLB 600M** in ⚙. |
 | The build fails on `cmake` | `brew install cmake`, then rerun `./scripts/install.sh`. |
-| "Accès réservé" when opening `127.0.0.1:47653` in a browser | That's expected: the API is reserved for the app window. To debug in a browser, see [Development](#development). |
+| No image, just a black screen | Check that mpv is installed (`brew install mpv`) and up to date. |
 
 ---
 
@@ -304,7 +301,7 @@ security delete-generic-password -s com.younss.ytlt -a anthropic-api-key 2>/dev/
 ```
 YouTube URL
    │
-   ├─ yt-dlp ──► video stream (HLS) ──────────────► native player (WebKit)
+   ├─ mpv (+ yt-dlp) ──► video ───────────────────► drawn under the Slint interface
    │
    ├─ yt-dlp ──► YouTube subtitles (json3/vtt) ──┐
    │                                              ├─► transcript (cached)
@@ -319,13 +316,12 @@ YouTube URL
 
 | Component | Technology |
 |---|---|
-| Window and "browser" | `tao` + `wry` (the system WebKit) |
-| Local server (API + interface) | `axum`, on `127.0.0.1`, protected by a session token |
+| Interface | **Slint** (`ui/app.slint`), OpenGL rendering |
+| Video | **libmpv**, drawn under the Slint interface in the same OpenGL context, placed on the screen area |
 | Reading YouTube | `yt-dlp` (external) |
 | Audio decoding | `symphonia` (AAC), plus a windowed-sinc resampler to 16 kHz, in pure Rust |
 | Transcription | `whisper-rs` (whisper.cpp, compiled in, Metal acceleration) |
 | Offline translation | `ct2rs` (CTranslate2, compiled in) + NLLB-200 int8 |
-| Interface | HTML/CSS/JS embedded in the binary (`rust-embed`) |
 
 **Writing systems:**
 - Chinese, Japanese and Thai have no spaces between words. The translation is spread across lines by characters (graphemes, so Thai vowel signs stay attached), and CJK characters count as double width for line length.
@@ -353,25 +349,22 @@ YouTube URL
 ```bash
 cargo build                 # debug build
 cargo test                  # unit tests
-cargo run -- --server       # local server only, no window
+cargo run --release         # launches the app
 ```
-
-- `--server` prints a URL of the form `http://127.0.0.1:47653/?t=<token>`: open it in a browser to test the interface.
-- The token changes on every launch.
 
 Project layout:
 
 ```
 src/
-  main.rs        window (tao/wry), IPC, full screen, session token
-  server.rs      HTTP API, jobs, caches, security (cookie/Host/CSP)
+  main.rs        Slint window, mpv player (OpenGL), playback loop, interface actions
+  core.rs        engine: config, models, shared transcription, jobs, caches, SRT export
   youtube.rs     yt-dlp calls: metadata, subtitles, streams, search, Mix
   audio.rs       HLS audio stream → AAC decoding → 16 kHz PCM (Rust, no ffmpeg)
   whisper.rs     built-in Whisper transcription, in chunks, with gap repair
   nmt.rs         built-in NLLB translation (CTranslate2)
   translate.rs   Google / MyMemory / Claude translators
   subs.rs        subtitle parsing (VTT, json3), merging, SRT export
-ui/              interface (index.html, style.css, app.js, boot.js)
+ui/app.slint     interface (Slint)
 scripts/         bundle.sh, install.sh, dmg.sh, make_icon.swift
 assets/icon.png  icon (generated by scripts/make_icon.swift)
 ```
@@ -380,13 +373,9 @@ assets/icon.png  icon (generated by scripts/make_icon.swift)
 
 ## Security
 
-- The local server listens on `127.0.0.1` only, so it can't be reached from the network.
-- Each launch generates a random 256-bit **session token**, given only to the app window. The window swaps it for an `HttpOnly` / `SameSite=Strict` cookie.
-- Every request without that cookie is rejected (403): other local programs, and websites open in a browser (CSRF).
-- The `Host` / `Origin` headers are checked, which blocks DNS rebinding.
+- **No network server:** the interface calls the engine directly, in the same process. No port is opened on the machine.
 - The Claude API key is stored in the **macOS Keychain**. `config.json` (mode 600) holds no secret.
-- The window only loads the app and the YouTube player. Any other navigation is refused, and pop-up windows open in the default browser.
-- A strict **Content-Security-Policy** is in place: only the app's scripts, the YouTube player/streams, hls.js and the fonts are allowed.
+- Only YouTube (through yt-dlp and mpv) and, if you pick them, Google, MyMemory or Claude are contacted over the network. With the local NMT, translation involves no service at all.
 
 ---
 
@@ -399,9 +388,13 @@ assets/icon.png  icon (generated by scripts/make_icon.swift)
 | CTranslate2 | MIT |
 | **NLLB-200** (translation models) | **CC-BY-NC 4.0, non-commercial use only** |
 | symphonia | MPL-2.0 |
+| **Slint** | Royalty-free Desktop License 2.0 (attribution: "About" window and badge below) |
+| mpv / libmpv | LGPL-2.1+ (dynamically linked, installed separately) |
 | yt-dlp | Unlicense |
 
 ---
+
+<a href="https://slint.dev"><img alt="Made with Slint" src="https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png" height="60"></a>
 
 ## License and disclaimer
 
