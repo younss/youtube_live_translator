@@ -32,12 +32,15 @@ fn default_nmt() -> String {
 
 /// config.json ne contient plus de secret, mais on le garde lisible par l'utilisateur seul.
 fn write_config(path: &std::path::Path, cfg: &Config) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, serde_json::to_vec_pretty(cfg)?)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -63,12 +66,30 @@ mod secrets {
         Ok(())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Windows : Gestionnaire d'identifiants ; Linux : trousseau Secret Service (GNOME/KDE).
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn get() -> Option<String> {
+        keyring::Entry::new(SERVICE, ACCOUNT).ok()?.get_password().ok().filter(|k| !k.is_empty())
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn set(key: Option<&str>) -> anyhow::Result<()> {
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT)?;
+        match key {
+            Some(k) => entry.set_password(k)?,
+            None => {
+                let _ = entry.delete_credential();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     pub fn get() -> Option<String> {
         None
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     pub fn set(_: Option<&str>) -> anyhow::Result<()> {
         anyhow::bail!("stockage sécurisé indisponible sur ce système")
     }

@@ -9,23 +9,42 @@ use tokio::process::Command;
 
 use crate::subs::{self, Cue};
 
-/// Les apps macOS lancées depuis le Finder n'héritent pas du PATH du shell :
-/// on regarde aussi les emplacements Homebrew habituels.
+/// Dossiers où chercher les outils externes (yt-dlp) : à côté de l'exécutable (version
+/// Windows livrée avec yt-dlp.exe), le PATH, puis les emplacements Homebrew — les apps
+/// macOS lancées depuis le Finder n'héritent pas du PATH du shell.
+fn tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+        dirs.push(dir);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    if cfg!(unix) {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    }
+    dirs
+}
+
 pub fn find_bin(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    path.split(':')
-        .map(PathBuf::from)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
-        .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+    let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    tool_dirs().into_iter().map(|dir| dir.join(&file)).find(|p| p.is_file())
 }
 
 fn ytdlp() -> Result<Command> {
-    let bin = find_bin("yt-dlp").ok_or_else(|| anyhow!("yt-dlp introuvable — installez-le : brew install yt-dlp"))?;
+    let bin = find_bin("yt-dlp").ok_or_else(|| anyhow!("yt-dlp introuvable — installez-le (brew install yt-dlp, ou yt-dlp.exe à côté de l'application)"))?;
     let mut cmd = Command::new(bin);
-    // yt-dlp peut avoir besoin de deno (déchiffrement des signatures) : PATH élargi à Homebrew.
-    let path = format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default());
-    cmd.env("PATH", path).kill_on_drop(true);
+    // yt-dlp peut avoir besoin de deno (déchiffrement des signatures) : même PATH élargi.
+    if let Ok(path) = std::env::join_paths(tool_dirs()) {
+        cmd.env("PATH", path);
+    }
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // Pas de fenêtre de console qui clignote à chaque appel de yt-dlp.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     Ok(cmd)
 }
 

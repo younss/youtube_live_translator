@@ -7,7 +7,7 @@ export struct PlItem { title: string, sel: bool, playing: bool }
 export struct ResItem { title: string, channel: string, duration: string }
 export struct TrItem { time: string, text: string, orig: string, now: bool }
 
-global Theme {
+export global Theme {
     out property <color> bg: #16171b;
     out property <color> metal-1: #3a3d45;
     out property <color> metal-2: #24262c;
@@ -24,7 +24,8 @@ global Theme {
     out property <color> warn: #ffd23d;
     out property <color> title-1: #2c3f7a;
     out property <color> title-2: #131c42;
-    out property <string> mono: "Menlo";
+    in-out property <string> mono: "Menlo";
+    in-out property <string> ui-font: "Helvetica Neue";
 }
 
 // ---------------------------------------------------------------- briques
@@ -218,7 +219,7 @@ export component AppWindow inherits Window {
     min-width: 760px;
     min-height: 560px;
     background: transparent;
-    default-font-family: "Helvetica Neue";
+    default-font-family: Theme.ui-font;
 
     // --- données envoyées par Rust
     in property <[string]> languages;                 // langues sources, « Auto » en tête

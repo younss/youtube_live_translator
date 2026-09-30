@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=YouTube Live Translator
+Comment=Lecteur YouTube avec sous-titres traduits en local
+Exec=youtube-live-translator
+Icon=youtube-live-translator
+Categories=AudioVideo;Video;Player;
+Terminal=false

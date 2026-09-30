@@ -11,7 +11,6 @@ libmpv2 = { version = "6", features = ["render"] }
 anyhow = "1"
 dirs = "6"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query", "form"] }
-ct2rs = { version = "0.10", features = ["accelerate"] }
 sentencepiece = "0.13"
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,14 +18,31 @@ serde_json = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
 unicode-segmentation = "1"
-whisper-rs = { version = "0.16", features = ["metal"] }
 
 [profile.release]
 lto = "thin"
 strip = true
 
+# Accélération matérielle : Metal (Whisper) et Accelerate (CTranslate2) sur macOS,
+# calcul CPU ailleurs.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+ct2rs = { version = "0.10", features = ["accelerate"] }
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ct2rs = "0.10"
+whisper-rs = "0.16"
+
+# Clé API dans le Gestionnaire d'identifiants Windows / le trousseau Secret Service (Linux).
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [build-dependencies]
 slint-build = "1.18"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

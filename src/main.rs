@@ -4,6 +4,9 @@
 //! `ytlt`          ouvre la fenêtre
 //! `ytlt --setup`  télécharge les modèles (utilisé par l'installateur)
 
+// Sous Windows : application graphique, sans fenêtre de console.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod audio;
 mod core;
 mod nmt;
@@ -750,6 +753,12 @@ fn main() -> Result<()> {
     let core = core::AppState::new(rt.handle().clone());
     slint::BackendSelector::new().require_opengl().select().map_err(|e| anyhow::anyhow!("OpenGL : {e}"))?;
     let ui = AppWindow::new()?;
+    // Polices présentes sur chaque système (Menlo / Helvetica n'existent pas sous Windows).
+    let theme = ui.global::<Theme>();
+    if cfg!(windows) {
+        theme.set_mono("Consolas".into());
+        theme.set_ui_font("Segoe UI".into());
+    }
 
     // Préférences et playlist enregistrées.
     let prefs: Prefs = load_json("prefs.json");

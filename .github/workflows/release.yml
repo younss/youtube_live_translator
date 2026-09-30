@@ -1,0 +1,111 @@
+# Construit les versions Windows et Linux sur des machines GitHub.
+# Lancement : onglet « Actions » > « Build Windows & Linux » > « Run workflow »,
+# ou automatiquement en poussant un tag v* (les archives sont alors jointes à la release).
+name: Build Windows & Linux
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: libmpv (paquet de développement shinchiro)
+        shell: pwsh
+        run: |
+          $headers = @{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}" }
+          $rel = Invoke-RestMethod -Headers $headers https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -like 'mpv-dev-x86_64-2*' } | Select-Object -First 1
+          if (-not $asset) { throw "paquet mpv-dev introuvable" }
+          Write-Host "libmpv : $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -ompv-dev -y | Out-Null
+          # MSVC accepte la bibliothèque d'import MinGW renommée en mpv.lib.
+          Copy-Item mpv-dev/libmpv.dll.a mpv-dev/mpv.lib
+          "MPV_LIB_DIR=$PWD\mpv-dev" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Icône .ico
+        run: |
+          python -m pip install --quiet pillow
+          python -c "from PIL import Image; Image.open('assets/icon.png').save('assets/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Paquet
+        shell: pwsh
+        run: |
+          $dist = "YouTube-Live-Translator"
+          New-Item -ItemType Directory $dist | Out-Null
+          Copy-Item target/release/ytlt.exe "$dist/YouTube Live Translator.exe"
+          Copy-Item mpv-dev/libmpv-2.dll $dist/
+          Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile "$dist/yt-dlp.exe"
+          Copy-Item packaging/LISEZMOI-Windows.txt, LICENSE $dist/
+          Compress-Archive -Path $dist -DestinationPath YouTube-Live-Translator-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-Live-Translator-windows-x64
+          path: YouTube-Live-Translator-windows-x64.zip
+
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: YouTube-Live-Translator-windows-x64.zip
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dépendances système
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang pkg-config libmpv-dev libdbus-1-dev \
+            libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Paquet
+        run: |
+          dist=YouTube-Live-Translator
+          mkdir -p $dist
+          cp target/release/ytlt $dist/youtube-live-translator
+          curl -sSL -o $dist/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+          chmod +x $dist/yt-dlp $dist/youtube-live-translator
+          cp assets/icon.png $dist/youtube-live-translator.png
+          cp packaging/youtube-live-translator.desktop packaging/install-linux.sh packaging/LISEZMOI-Linux.txt LICENSE $dist/
+          chmod +x $dist/install-linux.sh
+          tar czf YouTube-Live-Translator-linux-x64.tar.gz $dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-Live-Translator-linux-x64
+          path: YouTube-Live-Translator-linux-x64.tar.gz
+
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: YouTube-Live-Translator-linux-x64.tar.gz
