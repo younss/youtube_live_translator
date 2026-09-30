@@ -792,8 +792,8 @@ export component AppWindow inherits Window {
                                                     Text { text: item.playing ? "♪" : ""; color: Theme.lcd; vertical-alignment: center; }
                                                 }
                                                 pl-ta := TouchArea {
-                                                    clicked => { root.playlist-select(i); }
-                                                    double-clicked => { root.playlist-activate(i); }
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.playlist-activate(i); }
                                                 }
                                             }
                                         }
@@ -860,12 +860,13 @@ export component AppWindow inherits Window {
                                                     Text { text: item.duration; color: Theme.lcd-dim; font-family: Theme.mono; font-size: 12px; vertical-alignment: center; }
                                                 }
                                                 rs-ta := TouchArea {
-                                                    double-clicked => { root.result-play(i); }
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.result-play(i); }
                                                     pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.result-add(i); } }
                                                 }
                                             }
                                         }
-                                        Text { text: "Double-clic : lire · Clic droit : ajouter à la playlist"; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                                        Text { text: "Clic : lire · Clic droit : ajouter à la playlist"; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
                                     }
                                 }
                             }

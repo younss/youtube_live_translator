@@ -298,6 +298,8 @@ fn set_progress(ui: &AppWindow, p: f32, text: &str, kind: i32) {
     ui.set_job_kind(kind);
 }
 
+/// Met la playlist à jour. Si le nombre d'éléments n'a pas changé, les lignes sont modifiées
+/// sur place : reconstruire le modèle détruirait l'élément sous la souris et ferait perdre le clic.
 fn refresh_playlist(ui: &AppWindow) {
     let items: Vec<PlItem> = with_app(|a| {
         a.playlist
@@ -306,7 +308,16 @@ fn refresh_playlist(ui: &AppWindow) {
             .map(|(i, e)| PlItem { title: e.title.clone().into(), sel: a.selected == Some(i), playing: a.video.as_deref() == Some(&e.id) })
             .collect()
     });
-    ui.set_playlist(ModelRc::new(VecModel::from(items)));
+    let model = ui.get_playlist();
+    if model.row_count() == items.len() && items.len() > 0 {
+        for (i, item) in items.into_iter().enumerate() {
+            if model.row_data(i).as_ref() != Some(&item) {
+                model.set_row_data(i, item);
+            }
+        }
+    } else {
+        ui.set_playlist(ModelRc::new(VecModel::from(items)));
+    }
 }
 
 fn refresh_transcript(ui: &AppWindow) {
@@ -967,7 +978,16 @@ fn main() -> Result<()> {
     });
     let c = ctx.clone();
     ui.on_playlist_activate(move |i| {
-        if let Some(id) = with_app(|a| a.playlist.get(i as usize).map(|e| e.id.clone())) {
+        // Un clic lit la vidéo et la sélectionne (pour « − RETIRER »).
+        let Some(id) = with_app(|a| {
+            a.selected = Some(i as usize);
+            a.playlist.get(i as usize).map(|e| e.id.clone())
+        }) else {
+            return;
+        };
+        if with_app(|a| a.video.as_deref() == Some(id.as_str())) {
+            refresh_playlist(&c.ui()); // déjà en lecture : juste la sélection
+        } else {
             c.open_video(&id, false);
         }
     });
