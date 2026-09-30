@@ -538,18 +538,27 @@ impl Ctx {
             return;
         }
         if dir < 0 {
-            toast(&ui, "Début de la playlist");
+            // Pas d'élément précédent : on repart du début de la vidéo en cours.
+            let _ = self.mpv.command("seek", &["0", "absolute"]);
+            toast(&ui, "Début de la vidéo");
             return;
         }
-        let Some(video) = with_app(|a| (!a.fetching_mix).then(|| a.video.clone()).flatten()) else { return };
-        // Fin de la playlist : on enchaîne sur le Mix YouTube de la vidéo en cours.
+        let Some((video, title)) = with_app(|a| (!a.fetching_mix).then(|| a.video.clone().map(|v| (v, a.title.clone()))).flatten()) else {
+            return;
+        };
+        // Fin de la playlist : Mix YouTube de la vidéo en cours ; s'il est vide (YouTube n'en
+        // propose pas pour toutes les vidéos), recherche sur son titre.
         with_app(|a| a.fetching_mix = true);
         if !auto {
-            toast(&ui, "Recherche des vidéos suivantes (Mix YouTube)…");
+            toast(&ui, "Recherche des vidéos suivantes…");
         }
+        ui.set_status_text("Recherche des vidéos suivantes (Mix YouTube)…".into());
         let w = self.ui.clone();
         self.rt.spawn(async move {
-            let hits = youtube::mix(&video, 10).await;
+            let mut hits = youtube::mix(&video, 10).await;
+            if hits.as_ref().map_or(true, |h| h.iter().all(|x| x.id == video)) && !title.is_empty() && title != video {
+                hits = youtube::search(&title, 10).await.map(|h| h.into_iter().filter(|x| x.id != video).collect());
+            }
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = w.upgrade() else { return };
                 with_app(|a| a.fetching_mix = false);
@@ -564,8 +573,14 @@ impl Ctx {
                         save_playlist();
                         refresh_playlist(&ui);
                         match first {
-                            Some(id) => CTX.with(|c| c.borrow().as_ref().map(|c| c.open_video(&id, false))).unwrap_or(()),
-                            None => toast(&ui, "Pas de vidéo suivante trouvée"),
+                            Some(id) => {
+                                ui.set_status_text("".into());
+                                CTX.with(|c| c.borrow().as_ref().map(|c| c.open_video(&id, false))).unwrap_or(())
+                            }
+                            None => {
+                                toast(&ui, "Pas de vidéo suivante trouvée");
+                                ui.set_status_text("Pas de vidéo suivante : YouTube ne propose ni Mix ni résultat pour cette vidéo.".into());
+                            }
                         }
                     }
                     Err(e) => ui.set_status_text(format!("Mix YouTube : {e:#}").into()),
@@ -870,7 +885,15 @@ fn main() -> Result<()> {
         let _ = mpv.command("seek", &["0", "absolute"]);
     });
     let c = ctx.clone();
-    ui.on_prev(move || c.play_offset(-1, false));
+    ui.on_prev(move || {
+        // Comme dans les lecteurs habituels : après 3 s, « précédent » relance la vidéo en cours.
+        let t: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
+        if t > 3.0 {
+            let _ = mpv.command("seek", &["0", "absolute"]);
+        } else {
+            c.play_offset(-1, false);
+        }
+    });
     let c = ctx.clone();
     ui.on_next(move || c.play_offset(1, false));
     let w = ui.as_weak();

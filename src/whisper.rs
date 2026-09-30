@@ -299,15 +299,19 @@ pub fn transcribe_stream(
             ms => Some((ms as usize * RATE / 1000).saturating_sub(2 * RATE)),
         };
         let fill = covered.first_gap(0);
-        let pos = match head.map(|h| (h, covered.first_gap(h))) {
-            // Zone de lecture pas encore faite : on y va (dès que l'audio y est arrivé,
-            // sinon on avance le remplissage en attendant).
-            Some((h, g)) if g < h + 180 * RATE && (g + RATE < avail || done || fill >= avail) => g,
-            _ => fill,
-        };
-        if done && pos >= avail {
+        // Terminé seulement quand TOUT l'audio est couvert, du début à la fin (et pas dès que
+        // la zone de lecture l'est : sinon, tête de lecture en fin de vidéo = rien de transcrit).
+        if done && fill >= avail {
             break;
         }
+        let pos = match head.map(|h| (h, covered.first_gap(h))) {
+            // Zone de lecture pas encore faite et son audio est arrivé : on y va.
+            Some((h, g)) if g < h + 180 * RATE && g + RATE / 2 <= avail => g,
+            // Son audio n'est pas encore arrivé et rien d'autre à faire : on l'attend.
+            Some((h, g)) if g < h + 180 * RATE && !done && fill >= avail => g,
+            // Sinon (zone faite, au-delà de la fin…) : on complète depuis le début.
+            _ => fill,
+        };
         // Saut vers une autre zone : le compteur d'échecs repart de zéro.
         if last_pos == usize::MAX || pos.abs_diff(last_pos) > WINDOW {
             misses = 0;

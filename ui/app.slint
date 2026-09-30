@@ -1,7 +1,7 @@
 // Interface « VLC × Winamp » — métal sombre, écran LCD vert, accent orange.
 // La vidéo est dessinée par mpv SOUS l'interface (OpenGL) : la zone `stage` reste transparente.
 
-import { LineEdit, ListView, AboutSlint } from "std-widgets.slint";
+import { ListView, AboutSlint } from "std-widgets.slint";
 
 export struct PlItem { title: string, sel: bool, playing: bool }
 export struct ResItem { title: string, channel: string, duration: string }
@@ -913,7 +913,22 @@ export component AppWindow inherits Window {
                 Text { text: "RÉGLAGES"; color: Theme.accent; font-size: 13px; letter-spacing: 3px; font-family: Theme.mono; }
                 Field {
                     label: "Clé API Anthropic (pour le traducteur Claude)";
-                    key-input := LineEdit { input-type: password; placeholder-text: "sk-ant-… (vide = garder l'actuelle)"; }
+                    Rectangle {
+                        height: 28px;
+                        background: Theme.lcd-bg;
+                        border-width: 1px; border-radius: 3px;
+                        border-color: key-input.has-focus ? Theme.accent-dim : #000;
+                        key-input := TextInput {
+                            x: 8px; width: parent.width - 16px;
+                            input-type: password;
+                            color: Theme.lcd; font-family: Theme.mono; font-size: 13px;
+                            vertical-alignment: center; single-line: true;
+                        }
+                        if key-input.text == "": Text {
+                            x: 8px; text: "sk-ant-… (vide = garder l'actuelle)";
+                            color: Theme.lcd-dim; font-family: Theme.mono; font-size: 13px; vertical-alignment: center;
+                        }
+                    }
                 }
                 Text { text: root.key-state; color: Theme.muted; font-size: 11px; }
                 Field {
