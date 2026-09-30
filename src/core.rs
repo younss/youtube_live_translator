@@ -339,7 +339,12 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
     let cache_file = st.cache_dir.join("subs").join(format!(
         "{id}_{}_{}_{}_{}_{}_{}{}_v{CACHE_VERSION}.json",
         req.mode, req.source, target, req.translator, req.voice, req.addressee,
-        if req.translator == "local" { format!("_{}", st.config.lock().unwrap().nmt_model) } else { String::new() }
+        if req.translator == "local" {
+            let opus = crate::nmt::opus_dir(&st.cache_dir.join("models")).is_some();
+            format!("_{}{}", st.config.lock().unwrap().nmt_model, if opus { "_opus" } else { "" })
+        } else {
+            String::new()
+        }
     ));
     if !req.refresh {
         if let Ok(s) = tokio::fs::read_to_string(&cache_file).await {
@@ -368,8 +373,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
         None => {
             let models = st.cache_dir.join("models");
             let nmt_model = st.config.lock().unwrap().nmt_model.clone();
-            let live_dir = (req.translator == "local" && crate::nmt::is_ready(&models, &nmt_model))
-                .then(|| crate::nmt::model_dir(&models, &nmt_model));
+            let live_dir = (req.translator == "local" && crate::nmt::is_ready(&models, &nmt_model)).then(|| (models.clone(), nmt_model.clone()));
             let rx = join_or_start_hub(st, &id, req, &tkey, work.clone());
             follow_hub(rx, &req.source, target, live_dir, st.playhead(&id), &progress, &publish).await?
         }
@@ -402,7 +406,8 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                 let p = progress.clone();
                 let dl: Progress = Arc::new(move |f, s| p(0.6 + 0.1 * f, s));
                 let nmt_model = st.config.lock().unwrap().nmt_model.clone();
-                let dir = crate::nmt::ensure_model(&st.cache_dir.join("models"), &nmt_model, &dl).await?;
+                let models = st.cache_dir.join("models");
+                crate::nmt::ensure_model(&models, &nmt_model, &dl).await?;
                 let p = progress.clone();
                 let sub: Progress = Arc::new(move |f, s| p(0.7 + 0.29 * f, s));
                 // NLLB traduit phrase par phrase : on lui donne des phrases entières, pas des
@@ -413,6 +418,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                 let snapshot = cues.clone();
                 let publish = publish.clone();
                 let groups2 = groups.clone();
+                let nllb_name = nmt_model.clone();
                 let out = tokio::task::spawn_blocking(move || {
                     // Chaque lot traduit est publié tout de suite : l'affichage commence en ~1 s.
                     let on_chunk = |done: &[String]| {
@@ -424,13 +430,18 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
                         ready.truncate(translated);
                         publish(ready);
                     };
-                    crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &sub, &on_chunk)
+                    crate::nmt::translate_blocking(&models, &nllb_name, &lines, &src, &tgt, &sub, &on_chunk)
                 })
                 .await??;
                 for (g, t) in groups.iter().zip(&out) {
                     subs::distribute(t, &mut cues[g.clone()]);
                 }
-                translator = format!("NMT local (NLLB {nmt_model})");
+                let turkish_opus = base(&source_lang) == "tr" && crate::nmt::opus_dir(&st.cache_dir.join("models")).is_some();
+                translator = if turkish_opus {
+                    format!("NMT local (OPUS tr→en + NLLB {nmt_model})")
+                } else {
+                    format!("NMT local (NLLB {nmt_model})")
+                };
             }
             engine => {
                 let engine = if engine == "claude" { Engine::Claude } else { Engine::Google };
@@ -467,7 +478,7 @@ async fn run_pipeline(st: &AppState, req: &JobReq, progress: Progress, publish: 
 }
 
 /// À incrémenter quand le découpage des cues change : les caches écrits avant sont ignorés.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 fn transcript_key(id: &str, req: &JobReq) -> String {
     format!("{id}_{}_{}_v{CACHE_VERSION}", req.mode, req.source)
@@ -676,7 +687,7 @@ async fn follow_hub(
     mut rx: tokio::sync::watch::Receiver<HubState>,
     source: &str,
     target: &str,
-    live_dir: Option<std::path::PathBuf>,
+    live_dir: Option<(std::path::PathBuf, String)>,
     playhead: whisper::Playhead,
     progress: &Progress,
     publish: &Publish,
@@ -714,10 +725,12 @@ async fn follow_hub(
                 } else {
                     let groups = subs::translation_groups(&batch);
                     let lines: Vec<String> = groups.iter().map(|g| subs::group_text(&batch[g.clone()])).collect();
-                    let (dir, src, tgt) = (dir.clone(), base(&src), target.to_string());
+                    let ((models, nllb), src, tgt) = (dir.clone(), base(&src), target.to_string());
                     let quiet: Progress = Arc::new(|_, _| {});
-                    if let Ok(Ok(texts)) =
-                        tokio::task::spawn_blocking(move || crate::nmt::translate_blocking(&dir, &lines, &src, &tgt, &quiet, &|_| {})).await
+                    if let Ok(Ok(texts)) = tokio::task::spawn_blocking(move || {
+                        crate::nmt::translate_blocking(&models, &nllb, &lines, &src, &tgt, &quiet, &|_| {})
+                    })
+                    .await
                     {
                         for (g, t) in groups.iter().zip(&texts) {
                             subs::distribute(t, &mut batch[g.clone()]);

@@ -926,7 +926,7 @@ export component AppWindow inherits Window {
                 Field {
                     label: "Traduction locale (NMT, hors ligne)";
                     SkinCombo {
-                        model: ["NLLB 1.3B — meilleure qualité (~1,4 Go RAM)", "NLLB 600M — léger (~650 Mo RAM)"];
+                        model: ["NLLB 1.3B — équilibré (~1,4 Go RAM)", "NLLB 600M — léger (~650 Mo RAM)", "NLLB 3.3B — qualité max (~4,8 Go RAM, 3,2 Go à télécharger)"];
                         current-index <=> root.nmt-model;
                     }
                 }

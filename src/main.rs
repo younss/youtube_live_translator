@@ -80,7 +80,7 @@ const TRANSLATORS: [&str; 4] = ["local", "google", "claude", "youtube"];
 const HEIGHTS: [u32; 4] = [360, 480, 720, 1080];
 const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 /// Ordre du menu « Traduction locale » dans les réglages.
-const NMT_CHOICES: [&str; 2] = ["1.3b", "600m"];
+const NMT_CHOICES: [&str; 3] = ["1.3b", "600m", "3.3b"];
 
 fn fmt_time(t: f64) -> String {
     let t = if t.is_finite() && t > 0.0 { t as u64 } else { 0 };
@@ -1101,7 +1101,7 @@ fn main() -> Result<()> {
         let ui = c.ui();
         let key = (!key.trim().is_empty()).then(|| key.to_string());
         let whisper = core::WHISPER_MODELS[whisper_idx.clamp(0, 4) as usize].to_string();
-        let nmt = NMT_CHOICES[nmt_idx.clamp(0, 1) as usize].to_string();
+        let nmt = NMT_CHOICES[nmt_idx.clamp(0, 2) as usize].to_string();
         match c.core.save_settings(key, whisper, nmt) {
             Ok(()) => toast(&ui, "Réglages enregistrés"),
             Err(e) => ui.set_status_text(format!("Réglages non enregistrés : {e:#}").into()),

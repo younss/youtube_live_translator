@@ -12,7 +12,7 @@ Ou lancement direct depuis ce dossier :
   ./youtube-live-translator
 
 Au premier lancement, les modèles (~1,9 Go : Whisper + traduction NLLB) se téléchargent
-une seule fois dans ~/.cache/youtube-live-translator. Attendez « MODÈLES PRÊTS ».
+une seule fois (le modèle turc OPUS-MT est déjà inclus, dossier « models ») dans ~/.cache/youtube-live-translator. Attendez « MODÈLES PRÊTS ».
 
 La clé API Claude (facultative) est rangée dans le trousseau du bureau (GNOME Keyring /
 KWallet, via Secret Service).

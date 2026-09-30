@@ -15,6 +15,8 @@ echo "Installée dans $DEST/YouTube Live Translator.app"
 # partagé : l'app est prête dès le premier lancement et une réinstallation ne les retélécharge pas.
 echo "Installation des modèles…"
 "$DEST/YouTube Live Translator.app/Contents/MacOS/ytlt" --setup
+# Modèle turc OPUS-MT (meilleure compréhension du turc) : converti une fois s'il manque.
+./scripts/convert_opus.sh || echo "Modèle turc OPUS non installé : NLLB sera utilisé pour le turc."
 
 missing=""
 for tool in yt-dlp mpv; do

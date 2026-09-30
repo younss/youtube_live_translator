@@ -6,7 +6,7 @@ YouTube Live Translator — Windows (64 bits)
    Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » : l'application
    n'est pas signée. Cliquez sur « Informations complémentaires » puis « Exécuter quand même ».
 3. Au premier lancement, les modèles (~1,9 Go : Whisper + traduction NLLB) se téléchargent
-   une seule fois dans %LOCALAPPDATA%\youtube-live-translator. Attendez « MODÈLES PRÊTS ».
+   une seule fois (le modèle turc OPUS-MT est déjà inclus, dossier « models ») dans %LOCALAPPDATA%\youtube-live-translator. Attendez « MODÈLES PRÊTS ».
 
 Gardez yt-dlp.exe et libmpv-2.dll dans le même dossier que l'application.
 Si YouTube ne répond plus : téléchargez la dernière version de yt-dlp.exe

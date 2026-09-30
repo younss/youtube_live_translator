@@ -45,11 +45,16 @@ jobs:
       - name: Tests
         run: cargo test --release
 
+      - name: Modèle turc OPUS-MT (conversion CTranslate2)
+        run: |
+          python -m pip install --quiet ctranslate2 transformers sentencepiece torch
+          ct2-transformers-converter --model Helsinki-NLP/opus-mt-tc-big-tr-en --output_dir YouTube-Live-Translator/models/opus-mt-tc-big-tr-en-int8 --quantization int8 --copy_files source.spm target.spm --force
+
       - name: Paquet
         shell: pwsh
         run: |
           $dist = "YouTube-Live-Translator"
-          New-Item -ItemType Directory $dist | Out-Null
+          New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item target/release/ytlt.exe "$dist/YouTube Live Translator.exe"
           Copy-Item mpv-dev/libmpv-2.dll $dist/
           Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile "$dist/yt-dlp.exe"
@@ -82,6 +87,11 @@ jobs:
 
       - name: Tests
         run: cargo test --release
+
+      - name: Modèle turc OPUS-MT (conversion CTranslate2)
+        run: |
+          python3 -m pip install --quiet --break-system-packages ctranslate2 transformers sentencepiece torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          ct2-transformers-converter --model Helsinki-NLP/opus-mt-tc-big-tr-en --output_dir YouTube-Live-Translator/models/opus-mt-tc-big-tr-en-int8 --quantization int8 --copy_files source.spm target.spm --force
 
       - name: Paquet
         run: |
