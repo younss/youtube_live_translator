@@ -89,6 +89,23 @@ brew install cmake yt-dlp mpv
 
 Reinstalling the app never downloads the models again.
 
+### Windows and Linux
+
+The Windows and Linux versions are built by GitHub (`.github/workflows/release.yml`), only when a branch whose name starts with `build-` is pushed:
+
+```bash
+git push origin main:build-0.2.0
+```
+
+The archives appear in the repository's **Actions** tab, under **Artifacts**:
+
+| Archive | Contents |
+|---|---|
+| `YouTube-Live-Translator-windows-x64.zip` | `YouTube Live Translator.exe`, `libmpv-2.dll`, `yt-dlp.exe`: unzip it, then double-click |
+| `YouTube-Live-Translator-linux-x64.tar.gz` | the program, `yt-dlp`, a menu shortcut and `install-linux.sh`. Requires `libmpv2`. |
+
+On Windows and Linux, Whisper and the translation run on the CPU, with no GPU acceleration, so they are slower than on a Mac with Apple Silicon.
+
 ### Other install options
 
 | Command | Result |
